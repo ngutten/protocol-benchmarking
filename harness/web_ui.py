@@ -109,6 +109,7 @@ def _spawn_claude_pty(work_dir: str, prompt: str, protocol) -> tuple:
     else:
         for tool in protocol.get_allowed_tools():
             cmd_parts.extend(["--allowedTools", tool])
+        cmd_parts.append(prompt)
 
     env = os.environ.copy()
     env["TERM"] = "xterm-256color"
@@ -319,12 +320,12 @@ async def terminal_ws(ws: WebSocket):
         while True:
             try:
                 data = await loop.run_in_executor(None, _blocking_read_pty, fd)
-                if data:
-                    await ws.send_bytes(data)
-                else:
-                    # Process exited
+                if data is None:
+                    # Process exited (OSError/EOF)
                     await ws.send_text("\r\n[Process exited]\r\n")
                     break
+                elif data:
+                    await ws.send_bytes(data)
             except (OSError, WebSocketDisconnect):
                 break
 
@@ -444,6 +445,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   let termWs = null;
   let resizeWs = null;
   let fitAddon = null;
+  let dataDisposable = null;
+  let resizeDisposable = null;
 
   function initTerminal() {
     term = new window.Terminal({
@@ -477,7 +480,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       term.writeln('\\r\\n[Terminal disconnected]');
     };
 
-    term.onData((data) => {
+    // Dispose previous handlers to avoid duplicate input on subsequent stages
+    if (dataDisposable) { dataDisposable.dispose(); }
+    dataDisposable = term.onData((data) => {
       if (termWs && termWs.readyState === WebSocket.OPEN) {
         termWs.send(data);
       }
@@ -492,7 +497,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     };
     resizeWs.onopen = sendResize;
-    term.onResize(sendResize);
+    if (resizeDisposable) { resizeDisposable.dispose(); }
+    resizeDisposable = term.onResize(sendResize);
     fitAddon.fit();
   }
 

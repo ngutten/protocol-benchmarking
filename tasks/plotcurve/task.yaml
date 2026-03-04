@@ -5,6 +5,8 @@ description: >
   sine wave, then generalizes to accept arbitrary functions written in LaTeX
   notation (elementary functions only). Designed as a quick 2-stage test task.
 
+engine_cmd: "python3 plotcurve.py"
+
 domain_tags:
   - visualization
   - parsing

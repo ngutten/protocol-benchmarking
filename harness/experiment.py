@@ -87,11 +87,16 @@ class Experiment:
         self.protocol = ALL_PROTOCOLS[protocol_name]
         self.work_dir = Path(work_dir)
         self.log_dir = Path(log_dir)
-        self.engine_cmd = engine_cmd
         self.test_dir = self.task_dir / "tests"
 
-        # Load stages from task.yaml
+        # Load stages (and engine_cmd override) from task.yaml
         self.stages = self._load_stages()
+
+        # Allow task.yaml to override engine_cmd when caller used the default
+        if engine_cmd == "python3 minidb.py" and hasattr(self, '_task_engine_cmd'):
+            self.engine_cmd = self._task_engine_cmd
+        else:
+            self.engine_cmd = engine_cmd
 
         self.completed_stages = []
         self.all_metrics = []
@@ -105,6 +110,8 @@ class Experiment:
         if task_yaml.exists():
             with open(task_yaml) as f:
                 task_cfg = yaml.safe_load(f)
+            if "engine_cmd" in task_cfg:
+                self._task_engine_cmd = task_cfg["engine_cmd"]
             stages = task_cfg.get("stages", [])
             if stages:
                 # Build stage IDs matching the stage file naming: NN_id
