@@ -1,0 +1,91 @@
+name: minidb
+title: "MiniDB: Dynamically-Typed Multimedia Query Engine"
+description: >
+  A dynamically-typed in-memory query engine supporting heterogeneous columns,
+  binary blobs, lists, timestamps, type coercion, and mixed-type aggregation.
+  Designed to be out-of-distribution for LLMs trained on standard SQL engines.
+
+domain_tags:
+  - stateful
+  - parser
+  - numerical
+
+stages:
+  - id: select_where
+    spec: stages/01_select_where.md
+    type: feature_addition
+    training_tests: tests/training/test_01_select_where.py
+    holdout_tests: tests/holdout/test_01_select_where_holdout.py
+
+  - id: order_limit
+    spec: stages/02_order_limit.md
+    type: feature_addition
+    training_tests: tests/training/test_02_order_limit.py
+    holdout_tests: tests/holdout/test_02_order_limit_holdout.py
+    parallelizable_with: [aggregation]
+
+  - id: aggregation
+    spec: stages/03_aggregation.md
+    type: feature_addition
+    training_tests: tests/training/test_03_aggregation.py
+    holdout_tests: tests/holdout/test_03_aggregation_holdout.py
+    parallelizable_with: [order_limit]
+
+  - id: join
+    spec: stages/04_join.md
+    type: feature_addition
+    training_tests: tests/training/test_04_join.py
+    holdout_tests: tests/holdout/test_04_join_holdout.py
+
+  - id: list_ops
+    spec: stages/05_list_ops.md
+    type: feature_addition
+    training_tests: tests/training/test_05_list_ops.py
+    holdout_tests: tests/holdout/test_05_list_ops_holdout.py
+    parallelizable_with: [join]
+
+  - id: coercion_rules
+    spec: stages/06_coercion_rules.md
+    type: feature_addition
+    pipeline_tags: [implicit-invalidation]
+    training_tests: tests/training/test_06_coercion.py
+    holdout_tests: tests/holdout/test_06_coercion_holdout.py
+
+pipelines:
+  sequential_full:
+    stages: [select_where, order_limit, aggregation, join, list_ops, coercion_rules]
+    differential: sequential
+
+  parallel_order_agg:
+    stages:
+      - select_where
+      - parallel: [order_limit, aggregation]
+    differential: parallel
+
+  parallel_join_list:
+    stages:
+      - select_where
+      - order_limit
+      - parallel: [join, list_ops]
+    differential: parallel
+
+  roundtrip_translation:
+    stages:
+      - select_where
+      - order_limit
+      - aggregation
+      - translate: {target: "c++"}
+      - translate: {target: "python"}
+    differential: round_trip
+    pipeline_tags: [round-trip]
+
+  roundtrip_refactor:
+    stages:
+      - select_where
+      - order_limit
+      - aggregation
+      - join
+      - refactor: {target: "split into parser library and execution engine as separate modules"}
+      - refactor: {target: "merge back into single module"}
+    differential: round_trip
+    pipeline_tags: [round-trip, refactor-then-extend]
