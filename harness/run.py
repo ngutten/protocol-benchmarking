@@ -43,6 +43,10 @@ def main():
                         help="Timeout in seconds per stage for headless mode")
     parser.add_argument("--run-id", help="Custom run ID (default: auto-generated)")
     parser.add_argument("--model", help="Override model from protocol (e.g. claude-sonnet-4-6)")
+    parser.add_argument("--ui", action="store_true",
+                        help="Launch browser-based experiment UI instead of CLI")
+    parser.add_argument("--port", type=int, default=8765,
+                        help="Port for the web UI (default: 8765)")
     args = parser.parse_args()
 
     if args.list_protocols:
@@ -58,6 +62,21 @@ def main():
     # Allow CLI model override
     if args.model:
         protocol.model = args.model
+
+    # Web UI mode
+    if args.ui:
+        from harness.web_ui import launch_ui
+        launch_ui(
+            task_dir=args.task_dir,
+            protocol_name=args.protocol,
+            work_dir=args.work_dir,
+            log_dir=args.log_dir,
+            engine_cmd=args.engine_cmd,
+            model=args.model,
+            run_id=args.run_id,
+            port=args.port,
+        )
+        return
 
     # Determine run mode (default: interactive, since headless can stall
     # and is hard to diagnose)

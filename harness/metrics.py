@@ -74,7 +74,7 @@ def run_pytest(test_path, engine_cmd, conftest_dir=None, timeout=120):
     """Run pytest on a test file/dir and return structured results."""
     env = os.environ.copy()
     env["MINIDB_ENGINE_CMD"] = engine_cmd
-    cmd = ["python3", "-m", "pytest", test_path, "-v", "--tb=short", "-q"]
+    cmd = ["python3", "-m", "pytest", test_path, "-v", "--tb=short"]
     if conftest_dir:
         cmd.extend(["--rootdir", conftest_dir, "-c", "/dev/null"])
     try:
@@ -117,9 +117,11 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
     conftest_dir = test_dir
 
     # Training tests for this stage
+    # Match by stage_id or its numeric prefix (e.g. "06_coercion_rules" matches "test_06_coercion.py")
+    stage_prefix = stage_id.split("_")[0] if "_" in stage_id else ""
     tp = os.path.join(test_dir, "training")
     for f in os.listdir(tp) if os.path.isdir(tp) else []:
-        if stage_id in f and f.endswith(".py"):
+        if (stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f))) and f.endswith(".py"):
             results, _ = run_pytest(os.path.join(tp, f), engine_cmd, conftest_dir)
             metrics.training_tests_total += len(results)
             metrics.training_tests_passed += sum(1 for r in results if r.passed)
@@ -130,7 +132,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
     # Holdout tests for this stage
     hp = os.path.join(test_dir, "holdout")
     for f in os.listdir(hp) if os.path.isdir(hp) else []:
-        if stage_id in f and f.endswith(".py"):
+        if (stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f))) and f.endswith(".py"):
             results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir)
             metrics.holdout_tests_total += len(results)
             metrics.holdout_tests_passed += sum(1 for r in results if r.passed)
@@ -141,8 +143,9 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
     # Regression: holdout tests from previous stages
     reg_total = reg_failed = 0
     for prev in previous_stages:
+        prev_prefix = prev.split("_")[0] if "_" in prev else ""
         for f in os.listdir(hp) if os.path.isdir(hp) else []:
-            if prev in f and f.endswith(".py"):
+            if (prev in f or (prev_prefix and re.match(rf"test_{prev_prefix}_", f))) and f.endswith(".py"):
                 results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir)
                 reg_total += len(results)
                 reg_failed += sum(1 for r in results if not r.passed)

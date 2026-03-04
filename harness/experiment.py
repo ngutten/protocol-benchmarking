@@ -8,6 +8,7 @@ import json
 import os
 import time
 import shutil
+import yaml
 from datetime import datetime
 from pathlib import Path
 from .metrics import collect_stage_metrics, detect_merge_conflicts, StageMetrics
@@ -89,18 +90,40 @@ class Experiment:
         self.engine_cmd = engine_cmd
         self.test_dir = self.task_dir / "tests"
 
-        # Load task config
-        # (In a full version we'd parse task.yaml; for now we hardcode the stage order)
-        self.stages = [
-            "01_select_where", "02_order_limit", "03_aggregation",
-            "04_join", "05_list_ops", "06_coercion",
-        ]
+        # Load stages from task.yaml
+        self.stages = self._load_stages()
 
         self.completed_stages = []
         self.all_metrics = []
         self.git = None
 
         self.run_id = f"{protocol_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    def _load_stages(self):
+        """Load stage IDs from task.yaml, with fallback for minidb."""
+        task_yaml = self.task_dir / "task.yaml"
+        if task_yaml.exists():
+            with open(task_yaml) as f:
+                task_cfg = yaml.safe_load(f)
+            stages = task_cfg.get("stages", [])
+            if stages:
+                # Build stage IDs matching the stage file naming: NN_id
+                result = []
+                for i, s in enumerate(stages, 1):
+                    sid = s["id"]
+                    # Check if stage files use numbered prefix
+                    numbered = f"{i:02d}_{sid}"
+                    stage_file = self.task_dir / "stages" / f"{numbered}.md"
+                    if stage_file.exists():
+                        result.append(numbered)
+                    else:
+                        result.append(sid)
+                return result
+        # Fallback: hardcoded minidb stages
+        return [
+            "01_select_where", "02_order_limit", "03_aggregation",
+            "04_join", "05_list_ops", "06_coercion",
+        ]
 
     def setup(self):
         """Initialize workspace and git repo."""

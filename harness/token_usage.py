@@ -90,7 +90,7 @@ def get_session_token_usage(session_id: str, project_dir: str = None) -> dict:
             except json.JSONDecodeError:
                 continue
 
-            msg_usage = msg.get("usage", {})
+            msg_usage = msg.get("message", {}).get("usage", {}) if isinstance(msg.get("message"), dict) else msg.get("usage", {})
             if msg_usage:
                 usage["input_tokens"] += msg_usage.get("input_tokens", 0)
                 usage["output_tokens"] += msg_usage.get("output_tokens", 0)

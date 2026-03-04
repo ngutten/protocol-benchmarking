@@ -1,0 +1,29 @@
+name: plotcurve
+title: "PlotCurve: LaTeX Math Function Plotter"
+description: >
+  A Python script that plots mathematical functions. Starts with a hardcoded
+  sine wave, then generalizes to accept arbitrary functions written in LaTeX
+  notation (elementary functions only). Designed as a quick 2-stage test task.
+
+domain_tags:
+  - visualization
+  - parsing
+  - math
+
+stages:
+  - id: sine_plot
+    spec: stages/01_sine_plot.md
+    type: feature_addition
+    training_tests: tests/training/test_01_sine_plot.py
+    holdout_tests: tests/holdout/test_01_sine_plot_holdout.py
+
+  - id: latex_functions
+    spec: stages/02_latex_functions.md
+    type: feature_addition
+    training_tests: tests/training/test_02_latex_functions.py
+    holdout_tests: tests/holdout/test_02_latex_functions_holdout.py
+
+pipelines:
+  sequential_full:
+    stages: [sine_plot, latex_functions]
+    differential: sequential
