@@ -28,7 +28,7 @@ class GitManager:
         """Stage all changes and commit."""
         self._run("add", "-A")
         try:
-            self._run("commit", "-m", message)
+            self._run("commit", "--allow-empty", "-m", message)
         except RuntimeError:
             pass  # nothing to commit
         return self._run("rev-parse", "HEAD")
