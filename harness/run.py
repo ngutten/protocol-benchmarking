@@ -12,21 +12,46 @@ from harness.protocols import ALL_PROTOCOLS
 from harness.claude_runner import run_headless, run_interactive
 
 
+def list_protocols():
+    """Print a table of all discovered protocols and exit."""
+    if not ALL_PROTOCOLS:
+        print("No protocols found.")
+        return
+    name_w = max(len(p.name) for p in ALL_PROTOCOLS.values())
+    print(f"\n{'Protocol':<{name_w}}  Description")
+    print(f"{'-'*name_w}  {'-'*50}")
+    for proto in sorted(ALL_PROTOCOLS.values(), key=lambda p: p.name):
+        custom = " [custom cmd]" if proto.custom_command else ""
+        print(f"{proto.name:<{name_w}}  {proto.description}{custom}")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="MiniDB Benchmark Harness")
-    parser.add_argument("--task-dir", required=True, help="Path to task directory")
-    parser.add_argument("--protocol", required=True, choices=list(ALL_PROTOCOLS.keys()))
+    parser.add_argument("--list-protocols", action="store_true",
+                        help="List all available protocols and exit")
+    parser.add_argument("--task-dir", help="Path to task directory")
+    parser.add_argument("--protocol", choices=list(ALL_PROTOCOLS.keys()),
+                        help="Protocol to use")
     parser.add_argument("--work-dir", help="Working directory (default: auto-created under runs/)")
     parser.add_argument("--log-dir", help="Directory for log output (default: auto-created under runs/)")
     parser.add_argument("--engine-cmd", default="python3 minidb.py", help="Command to start the engine")
     parser.add_argument("--stages", nargs="*", help="Specific stages to run (default: all)")
     parser.add_argument("--mode", choices=["headless", "interactive", "manual"],
-                        default=None, help="Run mode (default: auto from protocol)")
+                        default=None, help="Run mode (default: interactive)")
     parser.add_argument("--timeout", type=int, default=None,
                         help="Timeout in seconds per stage for headless mode")
     parser.add_argument("--run-id", help="Custom run ID (default: auto-generated)")
     parser.add_argument("--model", help="Override model from protocol (e.g. claude-sonnet-4-6)")
     args = parser.parse_args()
+
+    if args.list_protocols:
+        list_protocols()
+        return
+
+    # --task-dir and --protocol are required when actually running
+    if not args.task_dir or not args.protocol:
+        parser.error("--task-dir and --protocol are required (or use --list-protocols)")
 
     protocol = ALL_PROTOCOLS[args.protocol]
 
@@ -34,13 +59,14 @@ def main():
     if args.model:
         protocol.model = args.model
 
-    # Determine run mode
+    # Determine run mode (default: interactive, since headless can stall
+    # and is hard to diagnose)
     if args.mode:
         mode = args.mode
     elif protocol.human_supervised:
         mode = "interactive"
     else:
-        mode = "headless"
+        mode = "interactive"
 
     # Set up run directory if work-dir/log-dir not explicitly provided
     if not args.work_dir or not args.log_dir:

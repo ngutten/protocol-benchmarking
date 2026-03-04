@@ -1,4 +1,5 @@
 """Claude Code invocation for headless and interactive benchmark runs."""
+import shlex
 import subprocess
 import time
 from .token_usage import parse_claude_json_output, get_session_token_usage
@@ -23,6 +24,19 @@ def _build_base_cmd(protocol, permission_mode="acceptEdits"):
 
     cmd.extend(["--output-format", "json"])
     return cmd
+
+
+def _expand_custom_command(protocol, prompt, work_dir):
+    """Expand {prompt} and {work_dir} placeholders in a custom_command.
+
+    Returns a new list with placeholders substituted.
+    """
+    expanded = []
+    for part in protocol.custom_command:
+        expanded.append(
+            part.replace("{prompt}", prompt).replace("{work_dir}", str(work_dir))
+        )
+    return expanded
 
 
 def _run_claude_p(cmd, work_dir, timeout=None):
@@ -73,7 +87,12 @@ def _merge_token_data(a, b):
 def run_headless(work_dir, prompt, protocol, timeout=None):
     """Run Claude Code in headless mode via `claude -p`.
 
-    For protocols with a planning phase, this runs TWO invocations:
+    If the protocol defines a custom_command, that command is used instead
+    of the internally generated claude invocation.  The placeholders
+    {prompt} and {work_dir} in custom_command elements are substituted.
+
+    For protocols with a planning phase (and no custom_command), this runs
+    TWO invocations:
       1. Plan phase: --permission-mode plan with the planning prompt
       2. Implementation phase: --permission-mode acceptEdits with the
          implementation prompt, starting fresh
@@ -107,6 +126,15 @@ def run_headless(work_dir, prompt, protocol, timeout=None):
         "is_error": False,
         "wall_time_seconds": 0.0,
     }
+
+    # --- Custom command path: delegate entirely to the user-defined command ---
+    if protocol.custom_command:
+        cmd = _expand_custom_command(protocol, prompt, work_dir)
+        parsed, wall_time = _run_claude_p(cmd, work_dir, timeout=timeout)
+        _backfill_usage(parsed)
+        combined.update(parsed)
+        combined["wall_time_seconds"] = wall_time
+        return combined
 
     if protocol.planning_phase and protocol.planning_prompt:
         # --- Phase 1: Planning (read-only) ---
@@ -165,6 +193,9 @@ def run_interactive(work_dir, prompt, protocol, session_id=None):
     Prints instructions, waits for the human to complete the session,
     then scrapes token usage from the session JSONL.
 
+    If the protocol defines a custom_command, it is shown to the operator
+    (with placeholders expanded) instead of the default claude command.
+
     Args:
         work_dir: Working directory for the Claude session.
         prompt: Description of what the session should accomplish.
@@ -181,7 +212,11 @@ def run_interactive(work_dir, prompt, protocol, session_id=None):
     print(f"Working directory: {work_dir}")
     print(f"\nPrompt for this stage:\n{prompt}")
 
-    if session_id:
+    if protocol.custom_command:
+        expanded = _expand_custom_command(protocol, prompt, work_dir)
+        print(f"\nRun your custom command:")
+        print(f"  {shlex.join(expanded)}")
+    elif session_id:
         print(f"\nResume previous session:")
         print(f"  claude --resume {session_id}")
     else:

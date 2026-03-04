@@ -2,10 +2,21 @@
 
 Each protocol defines how a stage should be executed, what files the LLM sees,
 and what instructions the human operator gets.
+
+Protocols are auto-discovered from Python files in this directory.  Any module
+that defines a module-level ``PROTOCOLS`` list (containing ProtocolDef instances)
+will have those protocols registered automatically.  Users can drop new .py
+files here to add custom protocols.
 """
+import importlib
+import pkgutil
 from dataclasses import dataclass, field
 from typing import Optional
 
+
+# ---------------------------------------------------------------------------
+# Tool lists
+# ---------------------------------------------------------------------------
 
 # Default tools that are always allowed in headless mode.
 # These cover common dev operations without being dangerous.
@@ -97,6 +108,10 @@ WEB_ACCESS_TOOLS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# ProtocolDef dataclass
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ProtocolDef:
     name: str
@@ -124,6 +139,12 @@ class ProtocolDef:
     allow_package_install: bool = False
     # Whether to allow web access (curl, wget, WebFetch, WebSearch)
     allow_web_access: bool = False
+    # Custom command line (list of strings) to use instead of internally
+    # generated claude commands.  When set, the harness will invoke this
+    # command for each stage instead of building a `claude` invocation.
+    # The placeholder {prompt} in any element will be replaced with the
+    # stage prompt, and {work_dir} with the workspace path.
+    custom_command: Optional[list] = None
 
     def get_allowed_tools(self) -> list:
         """Build the full list of --allowedTools for this protocol."""
@@ -136,63 +157,36 @@ class ProtocolDef:
         return tools
 
 
-# ---- Concrete protocols for the vertical slice ----
+# ---------------------------------------------------------------------------
+# Auto-discovery
+# ---------------------------------------------------------------------------
 
-DIRECT_NO_TESTS = ProtocolDef(
-    name="direct_no_tests",
-    description="LLM gets the stage spec only. No tests provided. Implement until done.",
-    provides_spec=True,
-    provides_training_tests=False,
-    added_instructions="Implement the following specification. You may run the engine "
-        "to test it manually, but no automated tests are provided.",
-)
+def _discover_protocols() -> dict:
+    """Scan all modules in this package for a ``PROTOCOLS`` list.
 
-DIRECT_SELF_TEST = ProtocolDef(
-    name="direct_self_test",
-    description="LLM gets the stage spec and is asked to write tests first, then implement.",
-    provides_spec=True,
-    provides_training_tests=False,
-    llm_writes_tests=True,
-    added_instructions="First, write a set of tests for the following specification. "
-        "Then implement the specification, iterating until your tests pass.",
-)
+    Each module may define::
 
-DIRECT_TESTS_PROVIDED = ProtocolDef(
-    name="direct_tests_provided",
-    description="LLM gets the stage spec and training tests. Implement until tests pass.",
-    provides_spec=True,
-    provides_training_tests=True,
-    added_instructions="Implement the following specification. A set of tests is provided "
-        "in the tests/ directory. Iterate until all provided tests pass.",
-)
+        PROTOCOLS = [ProtocolDef(...), ProtocolDef(...)]
 
-PLAN_AND_IMPLEMENT = ProtocolDef(
-    name="plan_and_implement",
-    description="LLM reads spec, drafts a plan, then implements in a clean-ish context.",
-    provides_spec=True,
-    provides_training_tests=True,
-    planning_phase=True,
-    planning_prompt="Read the following specification carefully. Draft an implementation "
-        "plan that describes: (1) what data structures you will use, (2) what the main "
-        "code changes are, (3) what edge cases you anticipate. Do NOT write any code yet.",
-    added_instructions="Now implement according to your plan. Tests are in tests/.",
-)
+    Returns a dict mapping protocol name -> ProtocolDef.
+    """
+    found = {}
+    package_path = __path__
+    for importer, modname, ispkg in pkgutil.iter_modules(package_path):
+        mod = importlib.import_module(f".{modname}", __package__)
+        protocol_list = getattr(mod, "PROTOCOLS", None)
+        if protocol_list is None:
+            continue
+        for proto in protocol_list:
+            if not isinstance(proto, ProtocolDef):
+                continue
+            if proto.name in found:
+                raise ValueError(
+                    f"Duplicate protocol name '{proto.name}' "
+                    f"(from module '{modname}', already registered)"
+                )
+            found[proto.name] = proto
+    return found
 
-HUMAN_SUPERVISED = ProtocolDef(
-    name="human_supervised",
-    description="Human breaks down the stage into sub-tasks and guides the LLM.",
-    provides_spec=True,
-    provides_training_tests=True,
-    human_supervised=True,
-    human_instructions="""You are supervising this stage. Steps:
-1. Read the stage spec and the task breakdown (provided separately).
-2. Give the LLM one sub-task at a time.
-3. Review the output before moving to the next sub-task.
-4. Decide when the stage is complete.
-Your time is being tracked from when you start until you signal completion.""",
-)
 
-ALL_PROTOCOLS = {p.name: p for p in [
-    DIRECT_NO_TESTS, DIRECT_SELF_TEST, DIRECT_TESTS_PROVIDED,
-    PLAN_AND_IMPLEMENT, HUMAN_SUPERVISED,
-]}
+ALL_PROTOCOLS = _discover_protocols()
