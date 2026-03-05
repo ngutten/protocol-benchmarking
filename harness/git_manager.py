@@ -72,3 +72,26 @@ class GitManager:
 
     def current_commit(self):
         return self._run("rev-parse", "HEAD")
+
+    def tag_exists(self, name):
+        """Check if a tag exists."""
+        try:
+            self._run("rev-parse", f"refs/tags/{name}")
+            return True
+        except RuntimeError:
+            return False
+
+    def list_tags(self, pattern=None):
+        """List tags, optionally filtered by glob pattern."""
+        if pattern:
+            output = self._run("tag", "-l", pattern)
+        else:
+            output = self._run("tag", "-l")
+        return [t for t in output.splitlines() if t.strip()]
+
+    def checkout_tag(self, tag_name, new_branch=None):
+        """Checkout a tag, optionally creating a new branch."""
+        if new_branch:
+            self._run("checkout", tag_name, "-b", new_branch)
+        else:
+            self._run("checkout", tag_name)
