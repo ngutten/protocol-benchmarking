@@ -9,8 +9,8 @@ with SELECT, WHERE, and the full dynamic type system.
 
 ### 1. Engine process
 
-A program that reads commands from stdin (one per line) and writes JSON responses
-to stdout (one per line). Keywords are case-insensitive.
+Create a program called `minidb.py` that reads commands from stdin (one per line)
+and writes JSON responses to stdout (one per line). Keywords are case-insensitive.
 
 ```
 > CREATE TABLE t (a, b, c)

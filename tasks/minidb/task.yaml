@@ -5,6 +5,8 @@ description: >
   binary blobs, lists, timestamps, type coercion, and mixed-type aggregation.
   Designed to be out-of-distribution for LLMs trained on standard SQL engines.
 
+engine_cmd: "python3 minidb.py"
+
 domain_tags:
   - stateful
   - parser
@@ -56,6 +58,17 @@ pipelines:
     stages: [select_where, order_limit, aggregation, join, list_ops, coercion_rules]
     differential: sequential
 
+  sequential_diff_ab:
+    stages:
+      - {stage: select_where, slot: A}
+      - {stage: order_limit, slot: B}
+      - {stage: aggregation, slot: B}
+      - {stage: join, slot: B}
+      - {stage: list_ops, slot: B}
+      - {stage: coercion_rules, slot: B}
+    differential: sequential
+    # Usage: --slots A=plan_and_implement,B=direct_tests_provided
+
   parallel_order_agg:
     stages:
       - select_where
@@ -74,9 +87,12 @@ pipelines:
       - select_where
       - order_limit
       - aggregation
-      - translate: {target: "c++"}
-      - translate: {target: "python"}
+      - {translate: {target: "c++"}, id: translate_cpp}
+      - {translate: {target: "python"}, id: translate_back}
     differential: round_trip
+    compare:
+      before: aggregation
+      after: translate_back
     pipeline_tags: [round-trip]
 
   roundtrip_refactor:
@@ -85,7 +101,20 @@ pipelines:
       - order_limit
       - aggregation
       - join
-      - refactor: {target: "split into parser library and execution engine as separate modules"}
-      - refactor: {target: "merge back into single module"}
+      - {refactor: {target: "split into parser library and execution engine as separate modules"}, id: refactor_split}
+      - {refactor: {target: "merge back into single module"}, id: refactor_merge}
     differential: round_trip
+    compare:
+      before: join
+      after: refactor_merge
     pipeline_tags: [round-trip, refactor-then-extend]
+
+  feature_churn:
+    stages:
+      - select_where
+      - order_limit
+      - {type: removal, target: select_where, id: remove_select}
+    differential: round_trip
+    compare:
+      before: order_limit
+      after: remove_select
