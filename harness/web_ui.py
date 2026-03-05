@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import pty
+import shutil
 import signal
 import struct
 import termios
@@ -41,6 +42,10 @@ state = {
     "presence_segment_start": None,
     "paused": False,
     "protocol": None,
+    # Deferred init fields
+    "task_dir": None,
+    "launch_kwargs": {},
+    "default_protocol": None,
 }
 
 
@@ -156,11 +161,83 @@ def _compute_human_time() -> float:
     return total
 
 
+def _consolidate_log(exp):
+    """Copy the experiment log JSON to the consolidated logs/ directory."""
+    if not exp or not exp.log_dir:
+        return
+    log_file = Path(exp.log_dir) / f"{exp.run_id}.json"
+    if not log_file.exists():
+        return
+    consolidated_dir = Path("logs")
+    consolidated_dir.mkdir(exist_ok=True)
+    shutil.copy2(str(log_file), str(consolidated_dir / log_file.name))
+
+
 # ---- API Routes ----
 
 @app.get("/")
 async def index():
     return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/api/protocols")
+async def get_protocols():
+    """Return all available protocols with metadata."""
+    protocols = []
+    for name, proto in sorted(ALL_PROTOCOLS.items()):
+        protocols.append({
+            "name": proto.name,
+            "description": proto.description,
+            "human_instructions": proto.human_instructions,
+            "added_instructions": proto.added_instructions,
+            "planning_phase": proto.planning_phase,
+            "planning_prompt": proto.planning_prompt,
+            "human_supervised": proto.human_supervised,
+            "model": proto.model,
+            "provides_training_tests": proto.provides_training_tests,
+            "llm_writes_tests": proto.llm_writes_tests,
+        })
+    return {
+        "protocols": protocols,
+        "default": state["default_protocol"],
+    }
+
+
+from fastapi import Request as FastAPIRequest
+
+
+@app.post("/api/experiment/init")
+async def init_experiment_api(request: FastAPIRequest):
+    """Initialize (or re-initialize) experiment with a chosen protocol."""
+    body = await request.json()
+    protocol_name = body.get("protocol")
+    if not protocol_name or protocol_name not in ALL_PROTOCOLS:
+        return {"error": f"Invalid protocol: {protocol_name}"}
+
+    task_dir = state["task_dir"]
+    if not task_dir:
+        return {"error": "No task directory configured"}
+
+    # Kill any running PTY
+    _kill_pty()
+
+    # Reset stage state
+    state["presence_segments"] = []
+    state["presence_status"] = "active"
+    state["stage_metrics"] = []
+    state["current_stage_idx"] = -1
+
+    # Initialize with stored kwargs
+    kwargs = dict(state["launch_kwargs"])
+    kwargs["model"] = kwargs.pop("model", None)
+    init_experiment(task_dir, protocol_name, **kwargs)
+
+    exp = state["experiment"]
+    return {
+        "run_id": exp.run_id,
+        "stages": list(exp.stages),
+        "protocol": protocol_name,
+    }
 
 
 @app.get("/api/state")
@@ -176,7 +253,39 @@ async def get_state():
             info["status"] = "in_progress"
         stages_info.append(info)
 
+    # Compute live stats
+    live_stats = None
+    if state["current_stage_idx"] >= 0 and state["stage_start_time"]:
+        wall_elapsed = time.time() - state["stage_start_time"]
+        human_time = _compute_human_time()
+        # Try to get live token count
+        live_tokens = 0
+        if exp:
+            session_id = _find_latest_session_id(str(exp.work_dir))
+            if session_id:
+                try:
+                    usage = get_session_token_usage(session_id)
+                    live_tokens = usage.get("total_tokens", 0)
+                except Exception:
+                    pass
+        live_stats = {
+            "wall_elapsed_seconds": round(wall_elapsed, 1),
+            "human_time_seconds": round(human_time, 1),
+            "live_tokens": live_tokens,
+        }
+
+    # Cumulative totals from completed stages
+    cumulative_tokens = sum(
+        m.get("total_tokens", 0) for m in state["stage_metrics"]
+        if isinstance(m, dict) and not m.get("skipped")
+    )
+    cumulative_human_time = sum(
+        m.get("human_time_seconds", 0) for m in state["stage_metrics"]
+        if isinstance(m, dict) and not m.get("skipped")
+    )
+
     return {
+        "initialized": exp is not None,
         "stages": stages_info,
         "current_stage_idx": state["current_stage_idx"],
         "protocol": state["protocol"].name if state["protocol"] else None,
@@ -184,6 +293,9 @@ async def get_state():
         "paused": state["paused"],
         "presence_status": state["presence_status"],
         "pty_active": state["child_pid"] is not None,
+        "live_stats": live_stats,
+        "cumulative_tokens": cumulative_tokens,
+        "cumulative_human_time": round(cumulative_human_time, 1),
     }
 
 
@@ -236,6 +348,7 @@ async def complete_stage():
         state["presence_segments"][-1]["end"] = time.time()
 
     human_time = _compute_human_time()
+    wall_time = time.time() - state["stage_start_time"] if state["stage_start_time"] else human_time
 
     # Kill PTY
     _kill_pty()
@@ -251,14 +364,15 @@ async def complete_stage():
             token_data = usage
 
     # Complete stage via experiment
-    metrics = exp.complete_stage(stage_id, human_time=human_time, token_data=token_data)
+    metrics = exp.complete_stage(stage_id, human_time=human_time, wall_time=wall_time, token_data=token_data)
     metrics_dict = metrics.to_dict()
 
     state["stage_metrics"].append(metrics_dict)
     state["current_stage_idx"] = -1
 
-    # Auto-save log
+    # Auto-save log and consolidate
     exp.save_log()
+    _consolidate_log(exp)
 
     return {"stage_id": stage_id, "metrics": metrics_dict}
 
@@ -299,6 +413,7 @@ async def abort_experiment():
     exp = state["experiment"]
     if exp:
         exp.save_log()
+        _consolidate_log(exp)
     return {"aborted": True}
 
 
@@ -389,8 +504,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   header h1 { font-size: 16px; color: #e94560; }
   .header-info { font-size: 13px; color: #888; }
   .main { display: flex; flex: 1; overflow: hidden; }
-  .sidebar { width: 280px; background: #16213e; border-right: 1px solid #0f3460; overflow-y: auto; padding: 12px; flex-shrink: 0; }
-  .terminal-area { flex: 1; display: flex; flex-direction: column; }
+  .sidebar-left { width: 280px; background: #16213e; border-right: 1px solid #0f3460; overflow-y: auto; padding: 12px; flex-shrink: 0; }
+  .sidebar-right { width: 320px; background: #16213e; border-left: 1px solid #0f3460; overflow-y: auto; padding: 12px; flex-shrink: 0; }
+  .terminal-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   .terminal-container { flex: 1; padding: 4px; }
   .controls { background: #16213e; border-top: 1px solid #0f3460; padding: 10px 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .stage-item { padding: 8px 10px; margin-bottom: 4px; border-radius: 6px; font-size: 13px; cursor: default; }
@@ -411,15 +527,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .presence-away { background: #f59e0b; color: #000; }
   .section-title { font-size: 11px; text-transform: uppercase; color: #666; margin: 12px 0 6px; letter-spacing: 0.5px; }
   #xterm { width: 100%; height: 100%; }
+  select { width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; font-size: 13px; margin-bottom: 8px; }
+  .proto-desc { font-size: 12px; color: #888; margin-bottom: 8px; min-height: 18px; }
+  .btn-init { width: 100%; margin-bottom: 12px; }
+  .info-panel { background: #1a1a2e; border-radius: 6px; padding: 10px; margin-bottom: 10px; font-size: 12px; line-height: 1.5; color: #ccc; white-space: pre-wrap; word-wrap: break-word; max-height: 250px; overflow-y: auto; }
+  .info-panel.empty { color: #555; font-style: italic; }
+  .stat-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; border-bottom: 1px solid #0f3460; }
+  .stat-label { color: #888; }
+  .stat-value { color: #e0e0e0; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .stats-panel { background: #1a1a2e; border-radius: 6px; padding: 10px; margin-bottom: 10px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Benchmark Experiment</h1>
-  <span class="header-info" id="header-info">Loading...</span>
+  <span class="header-info" id="header-info">Select a protocol to begin</span>
 </header>
 <div class="main">
-  <div class="sidebar">
+  <div class="sidebar-left">
+    <div class="section-title">Protocol</div>
+    <select id="protocol-select" onchange="updateProtocolInfo()">
+      <option value="">Loading...</option>
+    </select>
+    <div class="proto-desc" id="proto-desc"></div>
+    <button class="btn-primary btn-init" id="btn-init" onclick="initExperiment()">Initialize Experiment</button>
     <div class="section-title">Stages</div>
     <div id="stage-list"></div>
   </div>
@@ -428,13 +559,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="xterm"></div>
     </div>
     <div class="controls">
-      <button class="btn-primary" id="btn-start" onclick="startStage()">Start Stage</button>
+      <button class="btn-primary" id="btn-start" onclick="startStage()" disabled>Start Stage</button>
       <button class="btn-primary" id="btn-complete" onclick="completeStage()" disabled>Stage Complete</button>
-      <button class="btn-secondary" id="btn-skip" onclick="skipStage()">Skip</button>
+      <button class="btn-secondary" id="btn-skip" onclick="skipStage()" disabled>Skip</button>
       <span style="flex:1"></span>
       <button class="presence-active" id="btn-presence" onclick="togglePresence()">Active</button>
       <button class="btn-danger" onclick="abortExperiment()">Abort</button>
     </div>
+  </div>
+  <div class="sidebar-right">
+    <div class="section-title">Live Stats</div>
+    <div class="stats-panel" id="stats-panel">
+      <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value" id="stat-status">Not initialized</span></div>
+      <div class="stat-row"><span class="stat-label">Wall Clock</span><span class="stat-value" id="stat-wall">--</span></div>
+      <div class="stat-row"><span class="stat-label">Human Time</span><span class="stat-value" id="stat-human">--</span></div>
+      <div class="stat-row"><span class="stat-label">Live Tokens</span><span class="stat-value" id="stat-tokens">--</span></div>
+      <div class="stat-row"><span class="stat-label">Total Tokens</span><span class="stat-value" id="stat-cumul-tokens">0</span></div>
+      <div class="stat-row"><span class="stat-label">Total Human Time</span><span class="stat-value" id="stat-cumul-human">0m 0s</span></div>
+      <div class="stat-row"><span class="stat-label">Stages Done</span><span class="stat-value" id="stat-stages">0 / 0</span></div>
+    </div>
+    <div class="section-title">Human Instructions</div>
+    <div class="info-panel empty" id="panel-human-instructions">Select a protocol to see instructions</div>
+    <div class="section-title">Added Instructions</div>
+    <div class="info-panel empty" id="panel-added-instructions">Select a protocol to see added instructions</div>
+    <div class="section-title">Planning Prompt</div>
+    <div class="info-panel empty" id="panel-planning-prompt">Select a protocol to see planning prompt</div>
   </div>
 </div>
 
@@ -447,6 +596,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   let fitAddon = null;
   let dataDisposable = null;
   let resizeDisposable = null;
+  let protocolsData = [];
+
+  function formatDuration(seconds) {
+    if (seconds == null || isNaN(seconds)) return '--';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
 
   function initTerminal() {
     term = new window.Terminal({
@@ -459,9 +616,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     term.open(document.getElementById('xterm'));
     fitAddon.fit();
     term.writeln('Welcome to the Benchmark Experiment UI.');
-    term.writeln('Click "Start Stage" to begin.\\r\\n');
+    term.writeln('Select a protocol and click "Initialize Experiment" to begin.\\r\\n');
 
     window.addEventListener('resize', () => fitAddon.fit());
+  }
+
+  async function loadProtocols() {
+    const res = await fetch('/api/protocols');
+    const data = await res.json();
+    protocolsData = data.protocols;
+    const select = document.getElementById('protocol-select');
+    select.innerHTML = '';
+    protocolsData.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = p.name;
+      select.appendChild(opt);
+    });
+    // Pre-select default if provided
+    if (data.default && protocolsData.some(p => p.name === data.default)) {
+      select.value = data.default;
+    }
+    updateProtocolInfo();
+  }
+
+  function updateProtocolInfo() {
+    const name = document.getElementById('protocol-select').value;
+    const proto = protocolsData.find(p => p.name === name);
+    document.getElementById('proto-desc').textContent = proto ? proto.description : '';
+
+    const setPanel = (id, text) => {
+      const el = document.getElementById(id);
+      if (text && text.trim()) {
+        el.textContent = text.trim();
+        el.className = 'info-panel';
+      } else {
+        el.textContent = 'None';
+        el.className = 'info-panel empty';
+      }
+    };
+    setPanel('panel-human-instructions', proto ? proto.human_instructions : '');
+    setPanel('panel-added-instructions', proto ? proto.added_instructions : '');
+    setPanel('panel-planning-prompt', proto ? proto.planning_prompt : '');
+  }
+
+  async function initExperiment() {
+    const protocol = document.getElementById('protocol-select').value;
+    if (!protocol) return;
+    document.getElementById('btn-init').disabled = true;
+    document.getElementById('btn-init').textContent = 'Initializing...';
+    term.clear();
+    term.writeln(`Initializing experiment with protocol: ${protocol}...\\r\\n`);
+    const res = await fetch('/api/experiment/init', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({protocol}),
+    });
+    const data = await res.json();
+    document.getElementById('btn-init').disabled = false;
+    document.getElementById('btn-init').textContent = 'Initialize Experiment';
+    if (data.error) {
+      term.writeln('Error: ' + data.error);
+      return;
+    }
+    term.writeln(`Run ID: ${data.run_id}`);
+    term.writeln(`Stages: ${data.stages.join(', ')}\\r\\n`);
+    term.writeln('Click "Start Stage" to begin.\\r\\n');
+    refreshState();
   }
 
   function connectTerminal() {
@@ -503,40 +724,71 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   async function refreshState() {
-    const res = await fetch('/api/state');
-    const data = await res.json();
-    document.getElementById('header-info').textContent =
-      `Protocol: ${data.protocol || '?'} | Model: ${data.model || '?'}`;
+    try {
+      const res = await fetch('/api/state');
+      const data = await res.json();
 
-    const list = document.getElementById('stage-list');
-    list.innerHTML = '';
-    data.stages.forEach((s) => {
-      const div = document.createElement('div');
-      div.className = 'stage-item ' + s.status;
-      let label = s.id.replace(/_/g, ' ');
-      div.innerHTML = `<div>${label}</div>`;
-      if (s.metrics && !s.metrics.skipped) {
-        div.innerHTML += `<div class="metrics-mini">
-          Train: ${s.metrics.training_tests_passed}/${s.metrics.training_tests_total}
-          | Holdout: ${s.metrics.holdout_tests_passed}/${s.metrics.holdout_tests_total}
-          | Tokens: ${(s.metrics.total_tokens||0).toLocaleString()}
-        </div>`;
-      } else if (s.metrics && s.metrics.skipped) {
-        div.className = 'stage-item skipped';
-        div.innerHTML += `<div class="metrics-mini">Skipped</div>`;
+      // Header info
+      if (data.initialized) {
+        document.getElementById('header-info').textContent =
+          `Protocol: ${data.protocol || '?'} | Model: ${data.model || '?'}`;
       }
-      list.appendChild(div);
-    });
 
-    const hasActive = data.current_stage_idx >= 0;
-    const allDone = data.stages.every(s => s.status === 'completed' || s.metrics?.skipped);
-    document.getElementById('btn-start').disabled = hasActive || allDone;
-    document.getElementById('btn-complete').disabled = !hasActive;
-    document.getElementById('btn-skip').disabled = allDone;
+      // Stage list
+      const list = document.getElementById('stage-list');
+      list.innerHTML = '';
+      data.stages.forEach((s) => {
+        const div = document.createElement('div');
+        div.className = 'stage-item ' + s.status;
+        let label = s.id.replace(/_/g, ' ');
+        div.innerHTML = `<div>${label}</div>`;
+        if (s.metrics && !s.metrics.skipped) {
+          div.innerHTML += `<div class="metrics-mini">
+            Train: ${s.metrics.training_tests_passed}/${s.metrics.training_tests_total}
+            | Holdout: ${s.metrics.holdout_tests_passed}/${s.metrics.holdout_tests_total}
+            | Tokens: ${(s.metrics.total_tokens||0).toLocaleString()}
+          </div>`;
+        } else if (s.metrics && s.metrics.skipped) {
+          div.className = 'stage-item skipped';
+          div.innerHTML += `<div class="metrics-mini">Skipped</div>`;
+        }
+        list.appendChild(div);
+      });
 
-    const btn = document.getElementById('btn-presence');
-    btn.textContent = data.presence_status === 'active' ? 'Active' : 'Away';
-    btn.className = data.presence_status === 'active' ? 'presence-active' : 'presence-away';
+      // Button states
+      const hasActive = data.current_stage_idx >= 0;
+      const allDone = data.stages.length > 0 && data.stages.every(s => s.status === 'completed' || s.metrics?.skipped);
+      document.getElementById('btn-start').disabled = !data.initialized || hasActive || allDone;
+      document.getElementById('btn-complete').disabled = !hasActive;
+      document.getElementById('btn-skip').disabled = !data.initialized || allDone;
+
+      const btn = document.getElementById('btn-presence');
+      btn.textContent = data.presence_status === 'active' ? 'Active' : 'Away';
+      btn.className = data.presence_status === 'active' ? 'presence-active' : 'presence-away';
+
+      // Live stats
+      const completed = data.stages.filter(s => s.status === 'completed').length;
+      const total = data.stages.length;
+      document.getElementById('stat-stages').textContent = `${completed} / ${total}`;
+      document.getElementById('stat-cumul-tokens').textContent = (data.cumulative_tokens || 0).toLocaleString();
+      document.getElementById('stat-cumul-human').textContent = formatDuration(data.cumulative_human_time || 0);
+
+      if (data.live_stats) {
+        document.getElementById('stat-status').textContent = 'Stage in progress';
+        document.getElementById('stat-status').style.color = '#e94560';
+        document.getElementById('stat-wall').textContent = formatDuration(data.live_stats.wall_elapsed_seconds);
+        document.getElementById('stat-human').textContent = formatDuration(data.live_stats.human_time_seconds);
+        document.getElementById('stat-tokens').textContent = (data.live_stats.live_tokens || 0).toLocaleString();
+      } else if (data.initialized) {
+        document.getElementById('stat-status').textContent = allDone ? 'Complete' : 'Idle';
+        document.getElementById('stat-status').style.color = allDone ? '#4ade80' : '#888';
+        document.getElementById('stat-wall').textContent = '--';
+        document.getElementById('stat-human').textContent = '--';
+        document.getElementById('stat-tokens').textContent = '--';
+      }
+    } catch(e) {
+      // Silently ignore fetch errors (e.g., server restart)
+    }
   }
 
   async function startStage() {
@@ -585,6 +837,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   // Init
   initTerminal();
+  loadProtocols();
   refreshState();
   setInterval(refreshState, 5000);
 </script>
@@ -593,10 +846,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
-def launch_ui(task_dir: str, protocol_name: str, host: str = "0.0.0.0",
+def launch_ui(task_dir: str, protocol_name: str = None, host: str = "0.0.0.0",
               port: int = 8765, **kwargs):
-    """Initialize experiment and start the web server."""
+    """Store config for deferred init and start the web server."""
     import uvicorn
-    init_experiment(task_dir, protocol_name, **kwargs)
+
+    state["task_dir"] = task_dir
+    state["launch_kwargs"] = {
+        k: v for k, v in kwargs.items()
+        if k in ("engine_cmd", "model", "run_id", "work_dir", "log_dir")
+    }
+    state["default_protocol"] = protocol_name
+
+    # If protocol was provided via CLI, initialize immediately
+    if protocol_name:
+        init_experiment(task_dir, protocol_name, **state["launch_kwargs"])
+
     print(f"\n  Experiment UI: http://localhost:{port}\n")
     uvicorn.run(app, host=host, port=port, log_level="warning")

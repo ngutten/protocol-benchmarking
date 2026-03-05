@@ -52,7 +52,8 @@ def index_logs(logs):
     return index
 
 
-COST_METRICS = ["human_time_seconds", "token_cost", "code_lines"]
+COST_METRICS = ["human_time_seconds", "wall_time_seconds", "token_cost",
+                "effective_tokens", "code_lines"]
 QUALITY_METRICS = ["holdout_accuracy", "training_accuracy", "regression_rate"]
 ALL_METRICS = COST_METRICS + QUALITY_METRICS
 
@@ -178,18 +179,24 @@ def compute_all_differentials(log_dir, baseline="direct_tests_provided"):
     index = index_logs(logs)
     protocols = list(index.keys())
     all_results = []
-    
+
+    # Discover stages from baseline (or first available protocol)
+    base_stages = index.get(baseline, {})
+    if not base_stages:
+        # Fall back to first protocol that has stages
+        for p in protocols:
+            if index[p]:
+                base_stages = index[p]
+                break
+    stages = sorted(base_stages.keys())
+
     # Sequential differentials: compare each protocol against baseline
-    stages = ["01_select_where", "02_order_limit", "03_aggregation",
-              "04_join", "05_list_ops", "06_coercion"]
-    
     for proto in protocols:
         if proto == baseline:
             continue
-        for i in range(1, len(stages)):
-            stage_a = stages[i - 1]
-            stage_b = stages[i]
-            diffs = sequential_differential(index, proto, baseline, stage_a, stage_b)
+        # Direct per-stage comparison (same stage across protocols)
+        for stage in stages:
+            diffs = sequential_differential(index, proto, baseline, stage, stage)
             all_results.extend(diffs)
-    
+
     return all_results

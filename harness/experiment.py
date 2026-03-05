@@ -220,12 +220,14 @@ class Experiment:
 
         return "\n".join(parts)
 
-    def complete_stage(self, stage_id, human_time=0.0, token_data=None):
+    def complete_stage(self, stage_id, human_time=0.0, wall_time=None, token_data=None):
         """Run metrics collection after a stage is done.
 
         Args:
             stage_id: The stage identifier.
-            human_time: Wall-clock time in seconds.
+            human_time: Active human time in seconds (presence-tracked).
+            wall_time: Total wall-clock time in seconds. Defaults to human_time
+                      if not provided (backward compat for non-UI modes).
             token_data: Optional dict with input_tokens, output_tokens,
                        total_tokens, cache_read_tokens, cache_creation_tokens.
         """
@@ -243,6 +245,7 @@ class Experiment:
             previous_stages=list(self.completed_stages),
         )
         metrics.human_time_seconds = human_time
+        metrics.wall_time_seconds = wall_time if wall_time is not None else human_time
         metrics.git_commit = commit
         metrics.git_tag = f"{self.run_id}/{stage_id}"
 

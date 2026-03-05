@@ -53,6 +53,23 @@ def main():
         list_protocols()
         return
 
+    # Web UI mode — protocol is optional (can be selected in browser)
+    if args.ui:
+        if not args.task_dir:
+            parser.error("--task-dir is required (or use --list-protocols)")
+        from harness.web_ui import launch_ui
+        launch_ui(
+            task_dir=args.task_dir,
+            protocol_name=args.protocol,  # may be None
+            work_dir=args.work_dir,
+            log_dir=args.log_dir,
+            engine_cmd=args.engine_cmd,
+            model=args.model,
+            run_id=args.run_id,
+            port=args.port,
+        )
+        return
+
     # --task-dir and --protocol are required when actually running
     if not args.task_dir or not args.protocol:
         parser.error("--task-dir and --protocol are required (or use --list-protocols)")
@@ -62,21 +79,6 @@ def main():
     # Allow CLI model override
     if args.model:
         protocol.model = args.model
-
-    # Web UI mode
-    if args.ui:
-        from harness.web_ui import launch_ui
-        launch_ui(
-            task_dir=args.task_dir,
-            protocol_name=args.protocol,
-            work_dir=args.work_dir,
-            log_dir=args.log_dir,
-            engine_cmd=args.engine_cmd,
-            model=args.model,
-            run_id=args.run_id,
-            port=args.port,
-        )
-        return
 
     # Determine run mode (default: interactive, since headless can stall
     # and is hard to diagnose)

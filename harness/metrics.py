@@ -21,6 +21,7 @@ class StageMetrics:
     stage_id: str
     protocol: str
     human_time_seconds: float = 0.0
+    wall_time_seconds: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
@@ -61,12 +62,19 @@ class StageMetrics:
     def token_cost(self, value):
         self.total_tokens = value
 
+    def effective_tokens(self):
+        """Cost-weighted token count: cache reads at 0.1x, everything else at 1x."""
+        return (self.input_tokens + self.output_tokens
+                + self.cache_creation_tokens
+                + int(self.cache_read_tokens * 0.1))
+
     def to_dict(self):
         d = asdict(self)
         d["training_accuracy"] = self.training_accuracy()
         d["holdout_accuracy"] = self.holdout_accuracy()
         d["regression_rate"] = self.regression_rate()
         d["token_cost"] = self.total_tokens  # backward compat key
+        d["effective_tokens"] = self.effective_tokens()
         return d
 
 
