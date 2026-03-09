@@ -7,6 +7,7 @@ right model/working dir/prompt for each stage.
 import asyncio
 import fcntl
 import json
+import math
 import os
 import pty
 import shutil
@@ -14,6 +15,7 @@ import signal
 import struct
 import termios
 import time
+import yaml
 from datetime import datetime
 from pathlib import Path
 
@@ -909,6 +911,243 @@ def _blocking_read_pty(fd, size=4096):
         return None
 
 
+# ---- Visualization API endpoints ----
+
+def _effective_tokens(stage):
+    """Cost-weighted tokens: cache reads at 0.1x, everything else at 1x."""
+    return (stage.get("input_tokens", 0)
+            + stage.get("output_tokens", 0)
+            + stage.get("cache_creation_tokens", 0)
+            + int(stage.get("cache_read_tokens", 0) * 0.1))
+
+
+def _load_all_logs():
+    """Load all experiment logs from logs/ directory (and subdirectories)."""
+    logs = []
+    logs_dir = Path("logs")
+    if not logs_dir.exists():
+        return logs
+    for f in sorted(logs_dir.rglob("*.json")):
+        if f.name == "experiment_tree.json":
+            continue
+        try:
+            with open(f) as fh:
+                log = json.load(fh)
+            # Strip bulky test_results arrays, add effective_tokens
+            for s in log.get("stages", []):
+                s.pop("test_results", None)
+                if "effective_tokens" not in s:
+                    s["effective_tokens"] = _effective_tokens(s)
+            logs.append(log)
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return logs
+
+
+def _load_all_tasks():
+    """Load all task configs from tasks/*/task.yaml."""
+    tasks = {}
+    for task_yaml in sorted(Path("tasks").glob("*/task.yaml")):
+        try:
+            with open(task_yaml) as f:
+                cfg = yaml.safe_load(f)
+            task_path = str(task_yaml.parent)
+            stages = []
+            for s in cfg.get("stages", []):
+                if isinstance(s, dict) and "id" in s:
+                    stages.append({
+                        "id": s["id"],
+                        "pipeline_tags": s.get("pipeline_tags", []),
+                    })
+            tasks[task_path] = {
+                "name": cfg.get("name", task_yaml.parent.name),
+                "stages": stages,
+                "pipelines": cfg.get("pipelines", {}),
+                "domain_tags": cfg.get("domain_tags", []),
+            }
+        except Exception:
+            continue
+    return tasks
+
+
+@app.get("/api/logs")
+async def get_logs():
+    """Return all experiment logs with metrics (stripped of test_results)."""
+    return {"runs": _load_all_logs()}
+
+
+@app.get("/api/tasks")
+async def get_tasks():
+    """Return all task configurations with stage metadata."""
+    return {"tasks": _load_all_tasks()}
+
+
+@app.post("/api/differential/analyze")
+async def analyze_differential(request: FastAPIRequest):
+    """Compute A/B differential analysis.
+
+    Body: {
+        task: "tasks/minidb",
+        group_a: [0, 1],         # stage indices for group A
+        group_b: [2],            # stage indices for group B
+        treatment: "plan_and_implement",
+        baseline: "direct_tests_provided",
+        metrics: ["holdout_accuracy", "effective_tokens"]
+    }
+
+    The treatment condition: treatment protocol on all A stages, baseline on all B stages.
+    The baseline condition: baseline protocol on all A and B stages.
+    """
+    body = await request.json()
+    task_path = body.get("task", "")
+    group_a = body.get("group_a", [])
+    group_b = body.get("group_b", [])
+    treatment_proto = body.get("treatment", "")
+    baseline_proto = body.get("baseline", "")
+    metric_names = body.get("metrics", ["holdout_accuracy"])
+
+    # Load task config to get stage IDs
+    tasks = _load_all_tasks()
+    task_cfg = tasks.get(task_path)
+    if not task_cfg:
+        return {"error": f"Task not found: {task_path}"}
+
+    all_stage_ids = [s["id"] for s in task_cfg["stages"]]
+
+    # Map group indices to stage IDs
+    a_stages = set()
+    b_stages = set()
+    for idx in group_a:
+        if 0 <= idx < len(all_stage_ids):
+            a_stages.add(all_stage_ids[idx])
+    for idx in group_b:
+        if 0 <= idx < len(all_stage_ids):
+            b_stages.add(all_stage_ids[idx])
+
+    if not a_stages or not b_stages:
+        return {"error": "Both groups A and B must have at least one stage"}
+
+    # Load logs and filter to this task
+    logs = _load_all_logs()
+    task_logs = [l for l in logs if l.get("task", "").rstrip("/").endswith(task_path.split("/")[-1])]
+
+    # For each log, determine per-stage protocol mapping
+    def get_stage_protocol(log, stage_id):
+        sp = log.get("stage_protocols", {})
+        if stage_id in sp:
+            return sp[stage_id]
+        # Check stage-level protocol field
+        for s in log.get("stages", []):
+            if s["stage_id"] == stage_id or s["stage_id"].endswith(f"_{stage_id}"):
+                return s.get("protocol", log.get("protocol"))
+        return log.get("protocol")
+
+    def match_stage_id(stage_id, log_stages):
+        """Find a stage in log that matches (exact or with numeric prefix)."""
+        for s in log_stages:
+            sid = s["stage_id"]
+            if sid == stage_id or sid.endswith(f"_{stage_id}"):
+                return s
+        return None
+
+    # Find matching runs.
+    # Treatment condition: treatment on A stages, baseline on B stages.
+    # Baseline condition: baseline on all A+B stages.
+    # For single-protocol runs, we also accept: treatment on all stages
+    # (measures B-stage metrics after treatment was applied to A).
+    treatment_metric_values = {m: [] for m in metric_names}
+    baseline_metric_values = {m: [] for m in metric_names}
+    found_treatment = False
+    found_baseline = False
+
+    for log in task_logs:
+        stages_data = log.get("stages", [])
+        proto_map = {}
+        for sid in list(a_stages) + list(b_stages):
+            proto_map[sid] = get_stage_protocol(log, sid)
+
+        # Ideal match: treatment on A, baseline on B (mixed-protocol run)
+        a_treatment = all(proto_map.get(s) == treatment_proto for s in a_stages)
+        b_baseline = all(proto_map.get(s) == baseline_proto for s in b_stages)
+
+        # Also accept: treatment on all stages (single-protocol run with treatment)
+        all_treatment = all(proto_map.get(s) == treatment_proto for s in a_stages | b_stages)
+
+        # Baseline: baseline on all stages
+        all_baseline = all(proto_map.get(s) == baseline_proto for s in a_stages | b_stages)
+
+        if (a_treatment and b_baseline) or all_treatment:
+            found_treatment = True
+            for sid in b_stages:
+                stage_data = match_stage_id(sid, stages_data)
+                if stage_data:
+                    for m in metric_names:
+                        val = stage_data.get(m)
+                        if val is not None:
+                            treatment_metric_values[m].append(val)
+
+        if all_baseline:
+            found_baseline = True
+            for sid in b_stages:
+                stage_data = match_stage_id(sid, stages_data)
+                if stage_data:
+                    for m in metric_names:
+                        val = stage_data.get(m)
+                        if val is not None:
+                            baseline_metric_values[m].append(val)
+
+    # Compute stats
+    def compute_stats(values):
+        if not values:
+            return {"n": 0, "values": [], "mean": None, "std": None}
+        mean = sum(values) / len(values)
+        if len(values) > 1:
+            variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+            std = math.sqrt(variance)
+        else:
+            std = 0.0
+        return {"n": len(values), "values": values, "mean": mean, "std": std}
+
+    results = {}
+    for m in metric_names:
+        results[m] = {
+            "treatment": compute_stats(treatment_metric_values[m]),
+            "baseline": compute_stats(baseline_metric_values[m]),
+        }
+        t = results[m]["treatment"]
+        b = results[m]["baseline"]
+        if t["mean"] is not None and b["mean"] is not None:
+            results[m]["delta"] = t["mean"] - b["mean"]
+        else:
+            results[m]["delta"] = None
+
+    # Determine missing runs
+    missing = []
+    a_list = sorted(a_stages)
+    b_list = sorted(b_stages)
+    if not found_treatment:
+        missing.append({
+            "condition": "treatment",
+            "description": f"Need a run with {treatment_proto} on stages [{', '.join(a_list)}] and {baseline_proto} on stages [{', '.join(b_list)}]",
+            "protocol_map": {s: treatment_proto for s in a_list} | {s: baseline_proto for s in b_list},
+        })
+    if not found_baseline:
+        missing.append({
+            "condition": "baseline",
+            "description": f"Need a run with {baseline_proto} on all stages [{', '.join(sorted(a_stages | b_stages))}]",
+            "protocol_map": {s: baseline_proto for s in sorted(a_stages | b_stages)},
+        })
+
+    return {
+        "results": results,
+        "missing": missing,
+        "group_a": a_list,
+        "group_b": b_list,
+        "treatment_protocol": treatment_proto,
+        "baseline_protocol": baseline_proto,
+    }
+
+
 # ---- Dashboard HTML ----
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -923,6 +1162,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   header { background: #16213e; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #0f3460; }
   header h1 { font-size: 16px; color: #e94560; }
   .header-info { font-size: 13px; color: #888; }
+  .tab-bar { background: #16213e; display: flex; gap: 0; border-bottom: 2px solid #0f3460; padding: 0 20px; }
+  .tab-btn { padding: 8px 20px; font-size: 13px; font-weight: 500; color: #888; background: transparent; border: none; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+  .tab-btn:hover { color: #e0e0e0; }
+  .tab-btn.active { color: #e94560; border-bottom-color: #e94560; }
+  .tab-content { display: none; flex: 1; overflow: hidden; }
+  .tab-content.active { display: flex; }
   .main { display: flex; flex: 1; overflow: hidden; }
   .sidebar-left { width: 280px; background: #16213e; border-right: 1px solid #0f3460; overflow-y: auto; padding: 12px; flex-shrink: 0; }
   .sidebar-right { width: 320px; background: #16213e; border-left: 1px solid #0f3460; overflow-y: auto; padding: 12px; flex-shrink: 0; }
@@ -960,6 +1205,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .stat-label { color: #888; }
   .stat-value { color: #e0e0e0; font-weight: 500; font-variant-numeric: tabular-nums; }
   .stats-panel { background: #1a1a2e; border-radius: 6px; padding: 10px; margin-bottom: 10px; }
+  /* Visualization tab styles */
+  .viz-container { display: flex; flex: 1; overflow: hidden; }
+  .viz-sidebar { width: 300px; background: #16213e; border-right: 1px solid #0f3460; overflow-y: auto; padding: 16px; flex-shrink: 0; }
+  .viz-main { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; }
+  .viz-chart-wrap { flex: 1; min-height: 400px; position: relative; background: #1a1a2e; border-radius: 8px; padding: 12px; }
+  .viz-chart-wrap canvas { width: 100% !important; height: 100% !important; }
+  .viz-select { width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; font-size: 13px; margin-bottom: 8px; }
+  .viz-label { font-size: 11px; text-transform: uppercase; color: #666; margin: 10px 0 4px; letter-spacing: 0.5px; }
+  .viz-checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #ccc; padding: 3px 0; }
+  .viz-checkbox-row input[type="checkbox"] { accent-color: #e94560; }
+  .viz-btn { width: 100%; padding: 8px; border-radius: 6px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; background: #e94560; color: #fff; margin-top: 12px; }
+  .viz-btn:hover { background: #c73e54; }
+  .viz-info { background: #1a1a2e; border-radius: 6px; padding: 12px; margin-top: 12px; font-size: 12px; color: #ccc; line-height: 1.6; }
+  /* Differential tab styles */
+  .diff-container { display: flex; flex: 1; overflow: hidden; }
+  .diff-sidebar { width: 340px; background: #16213e; border-right: 1px solid #0f3460; overflow-y: auto; padding: 16px; flex-shrink: 0; }
+  .diff-main { flex: 1; padding: 20px; overflow-y: auto; }
+  .diff-stage-row { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 13px; }
+  .diff-stage-name { flex: 1; color: #ccc; min-width: 120px; }
+  .diff-radio-group { display: flex; gap: 12px; }
+  .diff-radio-group label { display: flex; align-items: center; gap: 3px; font-size: 12px; color: #888; cursor: pointer; }
+  .diff-radio-group input[type="radio"] { accent-color: #e94560; }
+  .diff-result-card { background: #1a1a2e; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+  .diff-result-header { font-size: 14px; font-weight: 600; color: #e94560; margin-bottom: 8px; }
+  .diff-stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+  .diff-stat .label { color: #888; }
+  .diff-stat .value { color: #e0e0e0; font-weight: 500; }
+  .diff-delta-positive { color: #4ade80; }
+  .diff-delta-negative { color: #ef4444; }
+  .diff-missing { background: #3b2020; border: 1px solid #7f1d1d; border-radius: 8px; padding: 14px; margin-top: 12px; }
+  .diff-missing-title { color: #fca5a5; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+  .diff-missing-item { color: #fca5a5; font-size: 12px; padding: 3px 0; }
+  .diff-preset-bar { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
+  .diff-preset-btn { padding: 3px 8px; font-size: 11px; border-radius: 4px; border: 1px solid #0f3460; background: #1a1a2e; color: #888; cursor: pointer; }
+  .diff-preset-btn:hover { background: #0f3460; color: #e0e0e0; }
 </style>
 </head>
 <body>
@@ -967,7 +1247,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <h1>Benchmark Experiment</h1>
   <span class="header-info" id="header-info">Select a protocol to begin</span>
 </header>
-<div class="main">
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('experiment')">Experiment</button>
+  <button class="tab-btn" onclick="switchTab('visualizer')">Results Visualizer</button>
+  <button class="tab-btn" onclick="switchTab('differential')">Differential Analysis</button>
+</div>
+<!-- Tab: Experiment (default) -->
+<div id="tab-experiment" class="tab-content active" style="flex-direction:column;flex:1;">
+<div class="main" style="flex:1;">
   <div class="sidebar-left">
     <div class="section-title">Protocol</div>
     <select id="protocol-select" onchange="updateProtocolInfo()">
@@ -1021,6 +1308,115 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="info-panel" id="panel-harness-log" style="font-size:10px; font-family:monospace; max-height:200px; overflow-y:auto; color:#888;"></div>
   </div>
 </div>
+</div><!-- end tab-experiment -->
+
+<!-- Tab: Results Visualizer -->
+<div id="tab-visualizer" class="tab-content">
+  <div class="viz-container">
+    <div class="viz-sidebar">
+      <div class="viz-label">Task</div>
+      <select class="viz-select" id="viz-task" onchange="vizTaskChanged()">
+        <option value="">All Tasks</option>
+      </select>
+
+      <div class="viz-label">Metric</div>
+      <select class="viz-select" id="viz-metric">
+        <option value="holdout_accuracy">Holdout Accuracy</option>
+        <option value="training_accuracy">Training Accuracy</option>
+        <option value="regression_rate">Regression Rate</option>
+        <option value="wall_time_seconds">Wall Time (s)</option>
+        <option value="human_time_seconds">Human Time (s)</option>
+        <option value="output_tokens">Output Tokens</option>
+        <option value="effective_tokens">Effective Tokens</option>
+        <option value="total_tokens">Total Tokens</option>
+        <option value="code_lines">Code Lines</option>
+        <option value="input_tokens">Input Tokens</option>
+        <option value="cache_creation_tokens">Cache Write Tokens</option>
+        <option value="cache_read_tokens">Cache Read Tokens</option>
+      </select>
+
+      <div class="viz-label">Group Bars By</div>
+      <select class="viz-select" id="viz-groupby">
+        <option value="stage">By Stage (bars = protocols)</option>
+        <option value="protocol">By Protocol (bars = stages)</option>
+      </select>
+
+      <div class="viz-label">View Mode</div>
+      <select class="viz-select" id="viz-viewmode">
+        <option value="single">Per-Stage Detail</option>
+        <option value="cumulative">Cumulative / Summary</option>
+      </select>
+
+      <div class="viz-label" style="margin-top:14px;">Options</div>
+      <div class="viz-checkbox-row">
+        <input type="checkbox" id="viz-errorbars" checked>
+        <label for="viz-errorbars">Show error bars (multi-run)</label>
+      </div>
+      <div class="viz-checkbox-row">
+        <input type="checkbox" id="viz-coalesce">
+        <label for="viz-coalesce">Coalesce by stage tags</label>
+      </div>
+
+      <button class="viz-btn" onclick="renderVizChart()">Update Chart</button>
+
+      <div class="viz-info" id="viz-info">
+        Load data and click Update Chart to visualize results.
+      </div>
+    </div>
+    <div class="viz-main">
+      <div class="viz-chart-wrap">
+        <canvas id="viz-chart"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Tab: Differential Analysis -->
+<div id="tab-differential" class="tab-content">
+  <div class="diff-container">
+    <div class="diff-sidebar">
+      <div class="viz-label">Task</div>
+      <select class="viz-select" id="diff-task" onchange="diffTaskChanged()">
+        <option value="">Select a task...</option>
+      </select>
+
+      <div class="viz-label">Treatment Protocol</div>
+      <select class="viz-select" id="diff-treatment"></select>
+
+      <div class="viz-label">Baseline Protocol</div>
+      <select class="viz-select" id="diff-baseline"></select>
+
+      <div class="viz-label">Metrics</div>
+      <div id="diff-metric-checkboxes">
+        <div class="viz-checkbox-row"><input type="checkbox" value="holdout_accuracy" checked><label>Holdout Accuracy</label></div>
+        <div class="viz-checkbox-row"><input type="checkbox" value="training_accuracy"><label>Training Accuracy</label></div>
+        <div class="viz-checkbox-row"><input type="checkbox" value="regression_rate"><label>Regression Rate</label></div>
+        <div class="viz-checkbox-row"><input type="checkbox" value="effective_tokens"><label>Effective Tokens</label></div>
+        <div class="viz-checkbox-row"><input type="checkbox" value="wall_time_seconds"><label>Wall Time</label></div>
+        <div class="viz-checkbox-row"><input type="checkbox" value="code_lines"><label>Code Lines</label></div>
+      </div>
+
+      <div class="viz-label" style="margin-top:14px;">Stage Groups</div>
+      <div class="diff-preset-bar" id="diff-presets"></div>
+      <div id="diff-stage-selector"></div>
+
+      <button class="viz-btn" onclick="runDifferential()">Analyze</button>
+    </div>
+    <div class="diff-main" id="diff-results">
+      <div class="diff-result-card">
+        <div style="color:#888;font-size:13px;">Select a task, configure groups A and B, then click Analyze.</div>
+        <div style="color:#666;font-size:12px;margin-top:8px;">
+          Group A = stages where the treatment protocol is applied.<br>
+          Group B = stages where the baseline protocol is applied (measurement point).<br><br>
+          The differential compares:<br>
+          Treatment: treatment on A, baseline on B<br>
+          vs. Baseline: baseline on all of A+B<br><br>
+          The effect is measured on the B stages.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <!-- Fork dialog -->
 <div id="fork-dialog" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:#16213e; border:1px solid #0f3460; border-radius:10px; padding:20px; z-index:1000; min-width:380px;">
@@ -1041,6 +1437,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script>
   let term = null;
   let termWs = null;
@@ -1051,6 +1448,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   let lastPtyActive = false;
   let lastStageIdx = -1;
   let protocolsData = [];
+
+  // Visualization state
+  let vizChart = null;
+  let vizLogsData = null;
+  let vizTasksData = null;
+  let diffChart = null;
+
+  function switchTab(tabId) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    const tab = document.getElementById('tab-' + tabId);
+    if (tab) tab.classList.add('active');
+    // Activate the button
+    const buttons = document.querySelectorAll('.tab-btn');
+    const tabNames = ['experiment', 'visualizer', 'differential'];
+    const idx = tabNames.indexOf(tabId);
+    if (idx >= 0 && buttons[idx]) buttons[idx].classList.add('active');
+    // Resize terminal when switching back to experiment tab
+    if (tabId === 'experiment' && fitAddon) {
+      setTimeout(() => fitAddon.fit(), 50);
+    }
+    // Load viz data when switching to visualizer or differential
+    if (tabId === 'visualizer' || tabId === 'differential') {
+      loadVizData();
+    }
+  }
 
   function formatDuration(seconds) {
     if (seconds == null || isNaN(seconds)) return '--';
@@ -1439,6 +1862,572 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     refreshState();
     loadTree();
     loadComparisons();
+  }
+
+  // ---- Results Visualizer ----
+
+  const VIZ_COLORS = [
+    '#e94560', '#3b82f6', '#22c55e', '#f59e0b', '#a78bfa',
+    '#06b6d4', '#f472b6', '#84cc16', '#fb923c', '#818cf8'
+  ];
+
+  async function loadVizData() {
+    if (vizLogsData && vizTasksData) return; // already loaded
+    try {
+      const [logsRes, tasksRes] = await Promise.all([
+        fetch('/api/logs'), fetch('/api/tasks')
+      ]);
+      vizLogsData = (await logsRes.json()).runs || [];
+      vizTasksData = (await tasksRes.json()).tasks || {};
+      populateVizSelectors();
+      populateDiffSelectors();
+    } catch(e) {
+      console.error('Failed to load viz data:', e);
+    }
+  }
+
+  function populateVizSelectors() {
+    // Task selector
+    const taskSel = document.getElementById('viz-task');
+    taskSel.innerHTML = '<option value="">All Tasks</option>';
+    const taskNames = new Set();
+    vizLogsData.forEach(r => { if (r.task) taskNames.add(r.task); });
+    Object.keys(vizTasksData).forEach(t => taskNames.add(t));
+    [...taskNames].sort().forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t;
+      const name = vizTasksData[t]?.name || t.split('/').pop();
+      opt.textContent = name;
+      taskSel.appendChild(opt);
+    });
+  }
+
+  function vizTaskChanged() {
+    // No special action needed; chart re-renders on button click
+  }
+
+  function getStageTag(taskPath, stageId) {
+    const task = vizTasksData[taskPath];
+    if (!task) return null;
+    const stage = task.stages.find(s =>
+      stageId === s.id || stageId.endsWith('_' + s.id)
+    );
+    if (stage && stage.pipeline_tags && stage.pipeline_tags.length > 0) {
+      return stage.pipeline_tags.join(', ');
+    }
+    return null;
+  }
+
+  function renderVizChart() {
+    if (!vizLogsData) { alert('No data loaded yet.'); return; }
+
+    const metric = document.getElementById('viz-metric').value;
+    const groupBy = document.getElementById('viz-groupby').value;
+    const viewMode = document.getElementById('viz-viewmode').value;
+    const showErrors = document.getElementById('viz-errorbars').checked;
+    const coalesce = document.getElementById('viz-coalesce').checked;
+    const taskFilter = document.getElementById('viz-task').value;
+
+    // Filter runs by task
+    let runs = vizLogsData;
+    if (taskFilter) {
+      runs = runs.filter(r => {
+        const rt = (r.task || '').replace(/\\/$/, '');
+        return rt === taskFilter || rt.endsWith('/' + taskFilter.split('/').pop());
+      });
+    }
+
+    if (runs.length === 0) {
+      document.getElementById('viz-info').textContent = 'No matching runs found.';
+      return;
+    }
+
+    // Collect all protocols and stages
+    const protocols = [...new Set(runs.map(r => r.protocol))].sort();
+    let stageIds = [];
+    runs.forEach(r => {
+      (r.stages || []).forEach(s => {
+        if (!stageIds.includes(s.stage_id)) stageIds.push(s.stage_id);
+      });
+    });
+
+    // Build data index: {protocol -> {stage_id -> [values]}}
+    const dataIndex = {};
+    protocols.forEach(p => { dataIndex[p] = {}; });
+    runs.forEach(r => {
+      const proto = r.protocol;
+      (r.stages || []).forEach(s => {
+        const val = s[metric];
+        if (val == null) return;
+        if (!dataIndex[proto][s.stage_id]) dataIndex[proto][s.stage_id] = [];
+        dataIndex[proto][s.stage_id].push(val);
+      });
+    });
+
+    // Handle coalescing by stage tags
+    let labelMap = {}; // stageId -> display label
+    if (coalesce && taskFilter) {
+      const tagGroups = {}; // tag -> [stageIds]
+      stageIds.forEach(sid => {
+        const tag = getStageTag(taskFilter, sid) || sid;
+        if (!tagGroups[tag]) tagGroups[tag] = [];
+        tagGroups[tag].push(sid);
+      });
+      // Merge stage values under tag labels
+      const newDataIndex = {};
+      protocols.forEach(p => {
+        newDataIndex[p] = {};
+        Object.entries(tagGroups).forEach(([tag, sids]) => {
+          const merged = [];
+          sids.forEach(sid => {
+            (dataIndex[p][sid] || []).forEach(v => merged.push(v));
+          });
+          if (merged.length > 0) newDataIndex[p][tag] = merged;
+        });
+      });
+      stageIds = Object.keys(tagGroups);
+      Object.assign(dataIndex, newDataIndex);
+    }
+
+    // Compute mean and std for each cell
+    function stats(arr) {
+      if (!arr || arr.length === 0) return { mean: 0, std: 0, n: 0 };
+      const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+      if (arr.length < 2) return { mean, std: 0, n: arr.length };
+      const variance = arr.reduce((a, b) => a + (b - mean) ** 2, 0) / (arr.length - 1);
+      return { mean, std: Math.sqrt(variance), n: arr.length };
+    }
+
+    let labels, datasets;
+
+    if (viewMode === 'cumulative') {
+      // Cumulative: one bar per protocol, aggregated across stages
+      labels = protocols;
+      const isRate = ['holdout_accuracy', 'training_accuracy', 'regression_rate'].includes(metric);
+      const values = [];
+      const errors = [];
+      protocols.forEach(p => {
+        // Collect all values across all stages for this protocol
+        const allVals = [];
+        stageIds.forEach(sid => {
+          (dataIndex[p][sid] || []).forEach(v => allVals.push(v));
+        });
+        if (isRate) {
+          // For rates, compute mean of means per run
+          const s = stats(allVals);
+          values.push(s.mean);
+          errors.push(showErrors ? s.std : 0);
+        } else {
+          // For absolute values, sum per run then average across runs
+          // Group by run
+          const perRun = {};
+          runs.filter(r => r.protocol === p).forEach(r => {
+            let total = 0;
+            (r.stages || []).forEach(s => {
+              if (s[metric] != null) total += s[metric];
+            });
+            perRun[r.run_id] = total;
+          });
+          const runTotals = Object.values(perRun);
+          const s = stats(runTotals);
+          values.push(s.mean);
+          errors.push(showErrors ? s.std : 0);
+        }
+      });
+      datasets = [{
+        label: metric,
+        data: values,
+        backgroundColor: VIZ_COLORS.slice(0, protocols.length),
+        borderColor: VIZ_COLORS.slice(0, protocols.length),
+        borderWidth: 1,
+      }];
+      if (showErrors) {
+        datasets[0].errorBars = errors;
+      }
+    } else if (groupBy === 'stage') {
+      // X-axis = stages, one dataset per protocol
+      labels = stageIds.map(s => s.replace(/^\\d+_/, ''));
+      datasets = protocols.map((proto, pi) => {
+        const values = stageIds.map(sid => stats(dataIndex[proto]?.[sid]).mean);
+        const errs = stageIds.map(sid => stats(dataIndex[proto]?.[sid]).std);
+        return {
+          label: proto,
+          data: values,
+          backgroundColor: VIZ_COLORS[pi % VIZ_COLORS.length] + 'cc',
+          borderColor: VIZ_COLORS[pi % VIZ_COLORS.length],
+          borderWidth: 1,
+          errorBars: showErrors ? errs : null,
+        };
+      });
+    } else {
+      // X-axis = protocols, one dataset per stage
+      labels = protocols;
+      datasets = stageIds.map((sid, si) => {
+        const values = protocols.map(p => stats(dataIndex[p]?.[sid]).mean);
+        const errs = protocols.map(p => stats(dataIndex[p]?.[sid]).std);
+        return {
+          label: sid.replace(/^\\d+_/, ''),
+          data: values,
+          backgroundColor: VIZ_COLORS[si % VIZ_COLORS.length] + 'cc',
+          borderColor: VIZ_COLORS[si % VIZ_COLORS.length],
+          borderWidth: 1,
+          errorBars: showErrors ? errs : null,
+        };
+      });
+    }
+
+    // Render chart
+    const ctx = document.getElementById('viz-chart').getContext('2d');
+    if (vizChart) vizChart.destroy();
+
+    // Error bar plugin
+    const errorBarPlugin = {
+      id: 'errorBars',
+      afterDatasetsDraw(chart) {
+        const { ctx: c, scales: { x, y } } = chart;
+        chart.data.datasets.forEach((ds, di) => {
+          if (!ds.errorBars) return;
+          const meta = chart.getDatasetMeta(di);
+          meta.data.forEach((bar, i) => {
+            const err = ds.errorBars[i];
+            if (!err || err === 0) return;
+            const xPos = bar.x;
+            const yVal = ds.data[i];
+            const yTop = y.getPixelForValue(yVal + err);
+            const yBot = y.getPixelForValue(yVal - err);
+            const capW = bar.width ? bar.width * 0.3 : 6;
+            c.save();
+            c.strokeStyle = '#e0e0e0';
+            c.lineWidth = 1.5;
+            c.beginPath();
+            c.moveTo(xPos, yTop);
+            c.lineTo(xPos, yBot);
+            c.moveTo(xPos - capW, yTop);
+            c.lineTo(xPos + capW, yTop);
+            c.moveTo(xPos - capW, yBot);
+            c.lineTo(xPos + capW, yBot);
+            c.stroke();
+            c.restore();
+          });
+        });
+      }
+    };
+
+    vizChart = new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: '#ccc' } },
+          title: {
+            display: true,
+            text: `${metric} ${viewMode === 'cumulative' ? '(cumulative)' : ''} ${coalesce ? '[coalesced by tags]' : ''}`,
+            color: '#e0e0e0',
+            font: { size: 14 },
+          },
+        },
+        scales: {
+          x: { ticks: { color: '#888', maxRotation: 45 }, grid: { color: '#0f3460' } },
+          y: { ticks: { color: '#888' }, grid: { color: '#0f3460' }, beginAtZero: true },
+        },
+      },
+      plugins: [errorBarPlugin],
+    });
+
+    // Update info panel
+    const totalRuns = runs.length;
+    const multiRun = protocols.some(p =>
+      stageIds.some(sid => (dataIndex[p]?.[sid]?.length || 0) > 1)
+    );
+    document.getElementById('viz-info').textContent =
+      `${totalRuns} runs, ${protocols.length} protocols, ${stageIds.length} stages` +
+      (multiRun ? ' (multi-run data available)' : '');
+  }
+
+  // ---- Differential Analysis ----
+
+  function populateDiffSelectors() {
+    // Task selector
+    const taskSel = document.getElementById('diff-task');
+    taskSel.innerHTML = '<option value="">Select a task...</option>';
+    Object.entries(vizTasksData).forEach(([path, cfg]) => {
+      const opt = document.createElement('option');
+      opt.value = path;
+      opt.textContent = cfg.name || path.split('/').pop();
+      taskSel.appendChild(opt);
+    });
+
+    // Protocol selectors
+    const protocols = [...new Set(vizLogsData.map(r => r.protocol))].sort();
+    ['diff-treatment', 'diff-baseline'].forEach(selId => {
+      const sel = document.getElementById(selId);
+      sel.innerHTML = '';
+      protocols.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p; opt.textContent = p;
+        sel.appendChild(opt);
+      });
+    });
+    // Default baseline to first protocol if multiple
+    if (protocols.length >= 2) {
+      document.getElementById('diff-treatment').value = protocols[1] || protocols[0];
+      document.getElementById('diff-baseline').value = protocols[0];
+    }
+  }
+
+  function diffTaskChanged() {
+    const taskPath = document.getElementById('diff-task').value;
+    const task = vizTasksData[taskPath];
+    const container = document.getElementById('diff-stage-selector');
+    const presets = document.getElementById('diff-presets');
+    container.innerHTML = '';
+    presets.innerHTML = '';
+
+    if (!task || !task.stages || task.stages.length === 0) {
+      container.innerHTML = '<div style="color:#666;font-size:12px;">No stages found.</div>';
+      return;
+    }
+
+    // Create stage radio buttons
+    task.stages.forEach((stage, idx) => {
+      const row = document.createElement('div');
+      row.className = 'diff-stage-row';
+      const name = `stage_group_${idx}`;
+      row.innerHTML = `
+        <span class="diff-stage-name">${idx + 1}. ${stage.id}</span>
+        <div class="diff-radio-group">
+          <label><input type="radio" name="${name}" value="a"> A</label>
+          <label><input type="radio" name="${name}" value="b"> B</label>
+          <label><input type="radio" name="${name}" value="" checked> --</label>
+        </div>
+      `;
+      container.appendChild(row);
+    });
+
+    // Generate preset buttons: A={1..k};B={k+1} for each valid split
+    const n = task.stages.length;
+    for (let k = 1; k < n; k++) {
+      const aStages = Array.from({length: k}, (_, i) => i + 1).join(',');
+      const bStage = k + 1;
+      const btn = document.createElement('button');
+      btn.className = 'diff-preset-btn';
+      btn.textContent = `A={${aStages}};B={${bStage}}`;
+      btn.onclick = () => applyDiffPreset(k, k);
+      presets.appendChild(btn);
+    }
+  }
+
+  function applyDiffPreset(aEnd, bStart) {
+    const task = vizTasksData[document.getElementById('diff-task').value];
+    if (!task) return;
+    task.stages.forEach((_, idx) => {
+      const radios = document.querySelectorAll(`input[name="stage_group_${idx}"]`);
+      radios.forEach(r => {
+        if (idx < aEnd && r.value === 'a') r.checked = true;
+        else if (idx === bStart && r.value === 'b') r.checked = true;
+        else if (idx >= aEnd && idx !== bStart && r.value === '') r.checked = true;
+        else if (idx < aEnd && r.value !== 'a') r.checked = false;
+        else if (idx === bStart && r.value !== 'b') r.checked = false;
+      });
+    });
+  }
+
+  async function runDifferential() {
+    const taskPath = document.getElementById('diff-task').value;
+    const treatment = document.getElementById('diff-treatment').value;
+    const baseline = document.getElementById('diff-baseline').value;
+
+    if (!taskPath) { alert('Select a task first.'); return; }
+    if (treatment === baseline) { alert('Treatment and baseline must be different protocols.'); return; }
+
+    const task = vizTasksData[taskPath];
+    const groupA = [];
+    const groupB = [];
+
+    task.stages.forEach((_, idx) => {
+      const selected = document.querySelector(`input[name="stage_group_${idx}"]:checked`);
+      if (selected && selected.value === 'a') groupA.push(idx);
+      else if (selected && selected.value === 'b') groupB.push(idx);
+    });
+
+    if (groupA.length === 0 || groupB.length === 0) {
+      alert('Assign at least one stage to group A and one to group B.');
+      return;
+    }
+
+    // Get selected metrics
+    const metrics = [];
+    document.querySelectorAll('#diff-metric-checkboxes input[type="checkbox"]:checked').forEach(cb => {
+      metrics.push(cb.value);
+    });
+    if (metrics.length === 0) { alert('Select at least one metric.'); return; }
+
+    const resultsDiv = document.getElementById('diff-results');
+    resultsDiv.innerHTML = '<div class="diff-result-card"><div style="color:#888;">Analyzing...</div></div>';
+
+    try {
+      const res = await fetch('/api/differential/analyze', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          task: taskPath,
+          group_a: groupA,
+          group_b: groupB,
+          treatment: treatment,
+          baseline: baseline,
+          metrics: metrics,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        resultsDiv.innerHTML = `<div class="diff-result-card"><div style="color:#ef4444;">${data.error}</div></div>`;
+        return;
+      }
+      renderDiffResults(data);
+    } catch(e) {
+      resultsDiv.innerHTML = `<div class="diff-result-card"><div style="color:#ef4444;">Request failed: ${e.message}</div></div>`;
+    }
+  }
+
+  function renderDiffResults(data) {
+    const resultsDiv = document.getElementById('diff-results');
+    let html = '';
+
+    // Summary card
+    const aStr = data.group_a.join(', ');
+    const bStr = data.group_b.join(', ');
+    html += `<div class="diff-result-card">
+      <div class="diff-result-header">Differential: ${data.treatment_protocol} vs ${data.baseline_protocol}</div>
+      <div class="diff-stat"><span class="label">Group A (treatment)</span><span class="value">${aStr}</span></div>
+      <div class="diff-stat"><span class="label">Group B (measured)</span><span class="value">${bStr}</span></div>
+    </div>`;
+
+    // Per-metric results
+    const metricNames = Object.keys(data.results || {});
+    metricNames.forEach(metric => {
+      const r = data.results[metric];
+      const t = r.treatment;
+      const b = r.baseline;
+      const hasTreatment = t.mean !== null && t.mean !== undefined;
+      const hasBaseline = b.mean !== null && b.mean !== undefined;
+
+      html += `<div class="diff-result-card">
+        <div class="diff-result-header">${metric}</div>`;
+
+      if (hasTreatment && hasBaseline) {
+        const delta = r.delta;
+        const deltaStr = delta > 0 ? `+${delta.toFixed(4)}` : delta.toFixed(4);
+        const deltaClass = delta > 0 ? 'diff-delta-positive' : (delta < 0 ? 'diff-delta-negative' : '');
+        const isGoodPositive = ['holdout_accuracy', 'training_accuracy'].includes(metric);
+        const isGoodNegative = ['regression_rate', 'effective_tokens', 'wall_time_seconds', 'human_time_seconds', 'code_lines'].includes(metric);
+
+        html += `
+          <div class="diff-stat"><span class="label">Treatment (n=${t.n})</span><span class="value">${t.mean.toFixed(4)} \\u00b1 ${t.std.toFixed(4)}</span></div>
+          <div class="diff-stat"><span class="label">Baseline (n=${b.n})</span><span class="value">${b.mean.toFixed(4)} \\u00b1 ${b.std.toFixed(4)}</span></div>
+          <div class="diff-stat"><span class="label">Delta</span><span class="value ${deltaClass}" style="font-size:15px;font-weight:700;">${deltaStr}</span></div>`;
+      } else {
+        if (!hasTreatment) html += '<div class="diff-stat"><span class="label">Treatment</span><span class="value" style="color:#ef4444;">No data</span></div>';
+        if (!hasBaseline) html += '<div class="diff-stat"><span class="label">Baseline</span><span class="value" style="color:#ef4444;">No data</span></div>';
+      }
+      html += '</div>';
+    });
+
+    // Chart for metrics
+    html += '<div class="diff-result-card"><div style="position:relative;height:300px;"><canvas id="diff-chart"></canvas></div></div>';
+
+    // Missing runs
+    if (data.missing && data.missing.length > 0) {
+      html += '<div class="diff-missing"><div class="diff-missing-title">Missing Runs</div>';
+      data.missing.forEach(m => {
+        html += `<div class="diff-missing-item">${m.description}</div>`;
+      });
+      html += '</div>';
+    }
+
+    resultsDiv.innerHTML = html;
+
+    // Render diff chart
+    const ctx = document.getElementById('diff-chart');
+    if (!ctx) return;
+    if (diffChart) diffChart.destroy();
+
+    const chartLabels = metricNames;
+    const treatmentVals = metricNames.map(m => data.results[m].treatment.mean || 0);
+    const baselineVals = metricNames.map(m => data.results[m].baseline.mean || 0);
+    const treatmentErrs = metricNames.map(m => data.results[m].treatment.std || 0);
+    const baselineErrs = metricNames.map(m => data.results[m].baseline.std || 0);
+
+    const errorBarPlugin = {
+      id: 'diffErrorBars',
+      afterDatasetsDraw(chart) {
+        const { ctx: c, scales: { x, y } } = chart;
+        chart.data.datasets.forEach((ds, di) => {
+          if (!ds.errorBars) return;
+          const meta = chart.getDatasetMeta(di);
+          meta.data.forEach((bar, i) => {
+            const err = ds.errorBars[i];
+            if (!err || err === 0) return;
+            const xPos = bar.x;
+            const yVal = ds.data[i];
+            const yTop = y.getPixelForValue(yVal + err);
+            const yBot = y.getPixelForValue(yVal - err);
+            const capW = bar.width ? bar.width * 0.3 : 6;
+            c.save();
+            c.strokeStyle = '#e0e0e0';
+            c.lineWidth = 1.5;
+            c.beginPath();
+            c.moveTo(xPos, yTop);
+            c.lineTo(xPos, yBot);
+            c.moveTo(xPos - capW, yTop);
+            c.lineTo(xPos + capW, yTop);
+            c.moveTo(xPos - capW, yBot);
+            c.lineTo(xPos + capW, yBot);
+            c.stroke();
+            c.restore();
+          });
+        });
+      }
+    };
+
+    diffChart = new Chart(ctx.getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: chartLabels,
+        datasets: [
+          {
+            label: `Treatment (${data.treatment_protocol})`,
+            data: treatmentVals,
+            backgroundColor: '#e94560cc',
+            borderColor: '#e94560',
+            borderWidth: 1,
+            errorBars: treatmentErrs,
+          },
+          {
+            label: `Baseline (${data.baseline_protocol})`,
+            data: baselineVals,
+            backgroundColor: '#3b82f6cc',
+            borderColor: '#3b82f6',
+            borderWidth: 1,
+            errorBars: baselineErrs,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { labels: { color: '#ccc' } },
+          title: { display: true, text: 'Treatment vs Baseline', color: '#e0e0e0' },
+        },
+        scales: {
+          x: { ticks: { color: '#888' }, grid: { color: '#0f3460' } },
+          y: { ticks: { color: '#888' }, grid: { color: '#0f3460' }, beginAtZero: true },
+        },
+      },
+      plugins: [errorBarPlugin],
+    });
   }
 
   // Init
