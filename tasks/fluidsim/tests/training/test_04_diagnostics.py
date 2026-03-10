@@ -149,3 +149,75 @@ class TestConfigDrivenDiagnostics:
             assert "enstrophy" in resp
         finally:
             os.unlink(config_path)
+
+
+class TestEnergyBalance:
+    """Test the fundamental energy-enstrophy balance relation.
+
+    For 2D incompressible flow with no forcing and no-slip boundaries:
+        dKE/dt = -2νZ
+    where Z is the enstrophy. This is the energy dissipation identity.
+    """
+
+    def test_dissipation_bounded_by_enstrophy(self, engine):
+        """Energy dissipation rate should be roughly consistent with 2νZ.
+
+        Set up decaying cavity flow and check that the measured dKE/dt
+        is in the right ballpark relative to -2νZ.
+        """
+        nu = 0.01
+        engine.create(nx=32, ny=32, lx=1.0, ly=1.0, viscosity=nu)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=100)
+
+        # Stop driving
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=2)
+
+        # Measure dissipation rate
+        diag1 = engine.get_diagnostics()
+        ke1 = diag1["kinetic_energy"]
+        z1 = diag1["enstrophy"]
+
+        engine.step(dt=0.005, steps=10)
+
+        diag2 = engine.get_diagnostics()
+        ke2 = diag2["kinetic_energy"]
+
+        dke_dt = (ke2 - ke1) / 0.05
+
+        # dKE/dt should be negative (dissipation)
+        assert dke_dt < 0, f"KE should decrease: dKE/dt = {dke_dt:.6f}"
+
+        # Compare to -2νZ
+        expected = -2.0 * nu * z1
+        if abs(expected) > 1e-8:
+            ratio = dke_dt / expected
+            # Allow wide tolerance for training (0.2 to 3.0)
+            assert 0.2 < ratio < 3.0, \
+                f"dKE/dt={dke_dt:.6f}, -2νZ={expected:.6f}, ratio={ratio:.3f}. " \
+                f"Expected ratio near 1.0."
+
+    def test_energy_decreasing_in_unforced_flow(self, engine):
+        """In an unforced closed cavity, KE should strictly decrease over time."""
+        engine.create(nx=32, ny=32, lx=1.0, ly=1.0, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=100)
+
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=5)
+
+        hist = engine.get_diagnostic_history("kinetic_energy")
+        # Check last several entries are monotonically decreasing
+        vals = hist["values"]
+        if len(vals) >= 5:
+            recent = vals[-5:]
+            for i in range(len(recent) - 1):
+                assert recent[i + 1] <= recent[i] + 1e-10, \
+                    f"KE not decreasing: step {i}: {recent[i]:.8f} -> {recent[i + 1]:.8f}"

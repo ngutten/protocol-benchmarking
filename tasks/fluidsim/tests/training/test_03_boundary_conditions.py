@@ -173,3 +173,68 @@ class TestLoadConfig:
             {"command": "load_config", "path": "/nonexistent/path.json"},
             "not found"
         )
+
+
+class TestPeriodicMomentum:
+    """Test momentum properties in periodic domains.
+
+    For periodic Poiseuille flow (periodic L-R, no-slip T-B, body force F),
+    the total x-momentum at steady state has an analytical value:
+        ∫∫ u dA = F·H³·L / (12ν)
+    """
+
+    def test_periodic_poiseuille_momentum(self, engine):
+        """Total x-momentum in periodic Poiseuille should match analytical value."""
+        H, L = 1.0, 1.0
+        nu = 0.1
+        F = 1.0
+        nx, ny = 32, 32
+
+        engine.create(nx=nx, ny=ny, lx=L, ly=H, viscosity=nu, force=[F, 0.0])
+        engine.set_boundary("left", "periodic", paired_with="right")
+        engine.set_boundary("right", "periodic", paired_with="left")
+        engine.set_boundary("top", "no_slip")
+        engine.set_boundary("bottom", "no_slip")
+        engine.solve_steady(tolerance=1e-6, max_iterations=50000)
+
+        # Compute total x-momentum from field
+        ux = engine.get_field("velocity_x")["data"]
+        dx, dy = L / nx, H / ny
+        total_mom = 0.0
+        for j in range(ny):
+            for i in range(nx):
+                total_mom += ux[j][i] * dx * dy
+
+        # Analytical: ∫u dy = (F/(2ν)) ∫₀ᴴ y(H-y) dy = F·H³/(12ν)
+        # Total momentum = L × F·H³/(12ν)
+        expected = L * F * H ** 3 / (12.0 * nu)
+        rel_err = abs(total_mom - expected) / expected
+        assert rel_err < 0.05, \
+            f"Periodic Poiseuille momentum: computed={total_mom:.6f}, " \
+            f"expected={expected:.6f}, rel_err={rel_err:.4f}"
+
+    def test_periodic_poiseuille_momentum_scales_with_viscosity(self, engine):
+        """Halving viscosity should double the total momentum (u ~ 1/ν)."""
+        H, L = 1.0, 1.0
+        F = 1.0
+        nx, ny = 32, 32
+
+        def get_momentum(eng, nu):
+            eng.create(nx=nx, ny=ny, lx=L, ly=H, viscosity=nu, force=[F, 0.0])
+            eng.set_boundary("left", "periodic", paired_with="right")
+            eng.set_boundary("right", "periodic", paired_with="left")
+            eng.set_boundary("top", "no_slip")
+            eng.set_boundary("bottom", "no_slip")
+            eng.solve_steady(tolerance=1e-6, max_iterations=50000)
+            ux = eng.get_field("velocity_x")["data"]
+            dx, dy = L / nx, H / ny
+            return sum(ux[j][i] * dx * dy for j in range(ny) for i in range(nx))
+
+        mom_1 = get_momentum(engine, 0.1)
+        engine.reset()
+        mom_2 = get_momentum(engine, 0.05)
+
+        ratio = mom_2 / mom_1
+        assert 1.8 < ratio < 2.2, \
+            f"Halving ν should double momentum: ratio={ratio:.3f}, " \
+            f"mom(ν=0.1)={mom_1:.4f}, mom(ν=0.05)={mom_2:.4f}"

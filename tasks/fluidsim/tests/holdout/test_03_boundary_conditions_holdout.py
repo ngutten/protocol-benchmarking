@@ -168,3 +168,135 @@ class TestConfigEndToEnd:
             assert val["value"] > 0
         finally:
             os.unlink(config_path)
+
+
+class TestPeriodicConservation:
+    """Test conservation properties in periodic domains.
+
+    Periodic boundaries allow cleaner tests of conservation since there are
+    no open boundaries where fluxes can enter or leave.
+    """
+
+    def test_periodic_couette_perturbation_decays(self, engine):
+        """Transverse perturbation on periodic Couette flow should decay.
+
+        Plane Couette flow (periodic L-R, moving top, no-slip bottom) is
+        linearly stable at all Re in 2D. A small v-perturbation introduced
+        via a temporary lid velocity change should decay, not grow.
+        This tests numerical stability of the advection scheme.
+        """
+        nx, ny = 32, 32
+        lx, ly = 1.0, 1.0
+        engine.create(nx=nx, ny=ny, lx=lx, ly=ly, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "periodic", paired_with="right")
+        engine.set_boundary("right", "periodic", paired_with="left")
+        engine.step(dt=0.01, steps=100)  # establish Couette-like flow
+
+        # Introduce transverse perturbation
+        engine.set_boundary("top", "velocity", value=[1.0, 0.05])
+        engine.step(dt=0.005, steps=20)
+
+        uy_data = engine.get_field("velocity_y")["data"]
+        dx, dy = lx / nx, ly / ny
+        vy_energy_pert = sum(
+            uy_data[j][i] ** 2 * dx * dy
+            for j in range(ny) for i in range(nx)
+        )
+
+        # Remove perturbation and let decay
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.step(dt=0.005, steps=200)
+
+        uy_data = engine.get_field("velocity_y")["data"]
+        vy_energy_after = sum(
+            uy_data[j][i] ** 2 * dx * dy
+            for j in range(ny) for i in range(nx)
+        )
+
+        assert vy_energy_after < vy_energy_pert, \
+            f"v-perturbation should decay: " \
+            f"perturbed={vy_energy_pert:.6f}, after={vy_energy_after:.6f}"
+
+    def test_periodic_poiseuille_force_balance(self, engine):
+        """In periodic Poiseuille, the wall shear stress should balance the body force.
+
+        Analytical: total wall shear = F × L × H (body force integrated over domain).
+        We check this indirectly: the velocity profile slope at walls should match
+        du/dy|_{y=0} = F·H/(2ν) and du/dy|_{y=H} = -F·H/(2ν).
+        """
+        H, L = 1.0, 1.0
+        nu = 0.05
+        F = 2.0
+        nx, ny = 32, 64  # fine grid in y for accurate wall gradient
+
+        engine.create(nx=nx, ny=ny, lx=L, ly=H, viscosity=nu, force=[F, 0.0])
+        engine.set_boundary("left", "periodic", paired_with="right")
+        engine.set_boundary("right", "periodic", paired_with="left")
+        engine.set_boundary("top", "no_slip")
+        engine.set_boundary("bottom", "no_slip")
+        engine.solve_steady(tolerance=1e-7, max_iterations=50000)
+
+        # Get profile near bottom wall
+        resp = engine.get_profile("velocity_x", "vertical", 0.5, n_points=64)
+        coords = resp["coordinates"]
+        values = resp["values"]
+
+        # Wall gradient at bottom: du/dy ≈ (u[1] - u[0]) / (y[1] - y[0])
+        # Analytical: du/dy|_{y=0} = F·H/(2ν)
+        expected_gradient = F * H / (2.0 * nu)
+
+        # Use first two interior points for gradient estimate
+        dy_near = coords[1] - coords[0]
+        gradient_bottom = (values[1] - values[0]) / dy_near
+
+        rel_err = abs(gradient_bottom - expected_gradient) / expected_gradient
+        assert rel_err < 0.1, \
+            f"Wall gradient: computed={gradient_bottom:.4f}, " \
+            f"expected={expected_gradient:.4f}, rel_err={rel_err:.3f}"
+
+    def test_periodic_channel_symmetry_across_resolutions(self, engine):
+        """Periodic Poiseuille profile should be symmetric about y=H/2 at different grids.
+
+        On a 16² and 32² grid, the profile should be symmetric and the
+        peak velocity should converge toward the analytical value.
+        """
+        H, L = 1.0, 1.0
+        nu = 0.1
+        F = 1.0
+
+        peaks = []
+        for nx, ny in [(16, 16), (32, 32)]:
+            engine.create(nx=nx, ny=ny, lx=L, ly=H, viscosity=nu, force=[F, 0.0])
+            engine.set_boundary("left", "periodic", paired_with="right")
+            engine.set_boundary("right", "periodic", paired_with="left")
+            engine.set_boundary("top", "no_slip")
+            engine.set_boundary("bottom", "no_slip")
+            engine.solve_steady(tolerance=1e-7, max_iterations=50000)
+
+            resp = engine.get_profile("velocity_x", "vertical", 0.5, n_points=40)
+            coords = resp["coordinates"]
+            values = resp["values"]
+
+            # Check symmetry
+            for k in range(len(coords)):
+                y_mirror = H - coords[k]
+                k_mirror = min(range(len(coords)), key=lambda m: abs(coords[m] - y_mirror))
+                if 0.1 < coords[k] < 0.9:
+                    assert abs(values[k] - values[k_mirror]) < 0.02, \
+                        f"Grid {nx}²: asymmetric at y={coords[k]:.2f}: " \
+                        f"u={values[k]:.4f} vs u(mirror)={values[k_mirror]:.4f}"
+
+            peaks.append(max(values))
+            if nx < 32:
+                engine.reset()
+
+        # Analytical peak: F·H²/(8ν) = 1.0*1.0/(8*0.1) = 1.25
+        u_max_exact = F * H ** 2 / (8.0 * nu)
+        # Finer grid should be closer to exact
+        err_coarse = abs(peaks[0] - u_max_exact) / u_max_exact
+        err_fine = abs(peaks[1] - u_max_exact) / u_max_exact
+        assert err_fine < err_coarse + 0.01, \
+            f"Finer grid should converge: peak(16²)={peaks[0]:.4f} (err={err_coarse:.4f}), " \
+            f"peak(32²)={peaks[1]:.4f} (err={err_fine:.4f}), exact={u_max_exact:.4f}"

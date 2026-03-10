@@ -26,11 +26,15 @@ from .state_tree import StateTree
 
 
 def generate_claude_md(stage_id: str, protocol: ProtocolDef, has_full_spec: bool = False,
-                       special_stage: dict = None) -> str:
+                       special_stage: dict = None, all_stage_files: list = None) -> str:
     """Generate a CLAUDE.md file for a stage.
 
     Contains protocol instructions and references to spec/stage files
     so the Claude session knows what to do.
+
+    Args:
+        all_stage_files: When provides_full_spec, list of stage filenames
+            (e.g. ["01_sine_plot.md", "02_latex_functions.md"]) copied to stages/.
     """
     lines = []
     lines.append("# Instructions")
@@ -48,9 +52,16 @@ def generate_claude_md(stage_id: str, protocol: ProtocolDef, has_full_spec: bool
         lines.append("")
     else:
         lines.append("## Reference Files")
-        lines.append("- Read `CURRENT_STAGE.md` for the current stage requirements.")
-        if has_full_spec:
-            lines.append("- Read `spec.md` for the full specification.")
+        if has_full_spec and all_stage_files:
+            lines.append(f"- **Current stage: `{stage_id}`**")
+            lines.append("- Read `CURRENT_STAGE.md` for the current stage requirements.")
+            lines.append("- The full specification is in `spec.md`.")
+            lines.append("- Individual stage specs are in the `stages/` directory:")
+            for sf in sorted(all_stage_files):
+                marker = " **(current)**" if stage_id in sf else ""
+                lines.append(f"  - `stages/{sf}`{marker}")
+        else:
+            lines.append("- Read `CURRENT_STAGE.md` for the current stage requirements.")
         lines.append("")
 
     if protocol.provides_training_tests:
@@ -95,6 +106,15 @@ def setup_run_directory(run_id: str, task_dir: str, protocol: ProtocolDef) -> di
         spec_src = task_dir / "spec.md"
         if spec_src.exists():
             shutil.copy2(spec_src, workspace / "spec.md")
+
+        # Copy all individual stage specs
+        stages_src = task_dir / "stages"
+        if stages_src.is_dir():
+            stages_dest = workspace / "stages"
+            stages_dest.mkdir(exist_ok=True)
+            for f in stages_src.iterdir():
+                if f.suffix == ".md":
+                    shutil.copy2(f, stages_dest / f.name)
 
     return {
         "workspace": str(workspace),
@@ -312,6 +332,15 @@ class Experiment:
                 if spec_src.exists():
                     shutil.copy2(spec_src, self.work_dir / "spec.md")
 
+                # Copy all individual stage specs
+                stages_src = self.task_dir / "stages"
+                if stages_src.is_dir():
+                    stages_dest = self.work_dir / "stages"
+                    stages_dest.mkdir(exist_ok=True)
+                    for f in stages_src.iterdir():
+                        if f.suffix == ".md":
+                            shutil.copy2(f, stages_dest / f.name)
+
             self.git.commit_all("Initial: empty workspace")
 
         print(f"Experiment {self.run_id} initialized in {self.work_dir}")
@@ -460,8 +489,14 @@ class Experiment:
 
         # Generate CLAUDE.md for the workspace
         has_full_spec = protocol.provides_full_spec and (self.work_dir / "spec.md").exists()
+        all_stage_files = None
+        if has_full_spec:
+            stages_dir = self.work_dir / "stages"
+            if stages_dir.is_dir():
+                all_stage_files = [f.name for f in stages_dir.iterdir() if f.suffix == ".md"]
         claude_md = generate_claude_md(stage_id, protocol, has_full_spec=has_full_spec,
-                                       special_stage=special_stage)
+                                       special_stage=special_stage,
+                                       all_stage_files=all_stage_files)
         (self.work_dir / "CLAUDE.md").write_text(claude_md)
 
         print(f"\n{'='*60}")
@@ -510,6 +545,8 @@ class Experiment:
 
             if protocol.provides_full_spec:
                 parts.append("The full specification is in spec.md for reference.")
+                parts.append("Individual stage specs are in the stages/ directory. "
+                             "Review them to understand the full project scope.")
 
         if protocol.provides_training_tests:
             parts.append("Run the tests in tests/ and iterate until they pass.")

@@ -203,3 +203,221 @@ class TestMassFluxChannelFlow:
         # should balance with no-slip walls having ~zero flux
         net = sum(flux.values())
         assert abs(net) < 1e-2, f"Net mass flux = {net}, should be ~0"
+
+
+class TestNumericalDissipation:
+    """Precise tests for numerical dissipation using the diagnostics API.
+
+    These tests use the energy-enstrophy identity dKE/dt = -2νZ and
+    diagnostic time series to directly measure numerical viscosity.
+    """
+
+    def test_energy_enstrophy_balance_precise(self, engine):
+        """dKE/dt ≈ -2νZ measured via diagnostics, within 50%.
+
+        This is a stricter version than the training test. On a 48² grid
+        at Re=100, a good second-order scheme should give a ratio close to 1.0.
+        First-order upwind would give ratio ≈ 2.0 and fail this test.
+        """
+        nu = 0.01
+        engine.create(nx=48, ny=48, lx=1.0, ly=1.0, viscosity=nu)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=200)
+
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=2)
+
+        ratios = []
+        for _ in range(6):
+            diag1 = engine.get_diagnostics()
+            ke1 = diag1["kinetic_energy"]
+            z1 = diag1["enstrophy"]
+
+            engine.step(dt=0.005, steps=5)
+
+            diag2 = engine.get_diagnostics()
+            ke2 = diag2["kinetic_energy"]
+            z2 = diag2["enstrophy"]
+
+            dke_dt = (ke2 - ke1) / 0.025
+            z_avg = (z1 + z2) / 2
+            expected = -2.0 * nu * z_avg
+
+            if abs(expected) > 1e-8:
+                ratios.append(dke_dt / expected)
+
+        assert len(ratios) >= 3
+        avg = sum(ratios) / len(ratios)
+        assert 0.5 < avg < 1.7, \
+            f"Energy-enstrophy ratio = {avg:.3f}, expected ~1.0. " \
+            f"Ratio > 1.5 indicates excessive numerical viscosity."
+
+    def test_decay_rate_scales_with_viscosity(self, engine):
+        """Doubling viscosity should roughly double the energy decay rate.
+
+        If numerical viscosity dominates, the decay rate won't change much
+        when the physical viscosity changes. This test checks that the
+        solver is actually using the specified viscosity.
+        """
+        def measure_decay(eng, nu):
+            eng.create(nx=32, ny=32, lx=1.0, ly=1.0, viscosity=nu)
+            eng.set_boundary("top", "velocity", value=[1.0, 0.0])
+            eng.set_boundary("bottom", "no_slip")
+            eng.set_boundary("left", "no_slip")
+            eng.set_boundary("right", "no_slip")
+            eng.step(dt=0.01, steps=100)
+
+            eng.set_boundary("top", "no_slip")
+            eng.step(dt=0.005, steps=2)
+
+            d1 = eng.get_diagnostics()
+            eng.step(dt=0.005, steps=10)
+            d2 = eng.get_diagnostics()
+
+            return (d2["kinetic_energy"] - d1["kinetic_energy"]) / 0.05
+
+        rate_1 = measure_decay(engine, 0.01)
+        engine.reset()
+        rate_2 = measure_decay(engine, 0.02)
+
+        # Both rates should be negative; rate_2 should be ~2x more negative
+        assert rate_1 < 0, f"Decay rate should be negative: {rate_1:.6f}"
+        assert rate_2 < 0, f"Decay rate should be negative: {rate_2:.6f}"
+
+        ratio = rate_2 / rate_1
+        assert 1.3 < ratio < 3.0, \
+            f"Doubling ν should ~double decay rate: ratio={ratio:.3f}, " \
+            f"rate(ν=0.01)={rate_1:.6f}, rate(ν=0.02)={rate_2:.6f}"
+
+    def test_no_spurious_energy_production(self, engine):
+        """KE should never increase during unforced, no-slip decay.
+
+        Check every entry in the diagnostic history after stopping the lid.
+        Any increase indicates a numerical instability or energy-producing bug.
+        """
+        engine.create(nx=32, ny=32, lx=1.0, ly=1.0, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=100)
+
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=100)
+
+        hist = engine.get_diagnostic_history("kinetic_energy")
+        vals = hist["values"]
+
+        # Check the decay portion (latter entries, after lid was stopped)
+        # The history covers all steps; use the last 100 entries
+        decay_vals = vals[-100:] if len(vals) >= 100 else vals[-50:]
+
+        for i in range(len(decay_vals) - 1):
+            assert decay_vals[i + 1] <= decay_vals[i] + 1e-10, \
+                f"KE increased at step {i}: {decay_vals[i]:.10f} -> {decay_vals[i + 1]:.10f}"
+
+    def test_enstrophy_decays_during_free_evolution(self, engine):
+        """Enstrophy should also decay in unforced flow (not grow spuriously).
+
+        While enstrophy can grow in driven 2D turbulence, in decaying flow
+        with no forcing it should decrease (in 2D, enstrophy is bounded by
+        its initial value for Navier-Stokes).
+        """
+        engine.create(nx=32, ny=32, lx=1.0, ly=1.0, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=100)
+
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=5)
+
+        z_initial = engine.get_diagnostics()["enstrophy"]
+        engine.step(dt=0.005, steps=100)
+        z_final = engine.get_diagnostics()["enstrophy"]
+
+        assert z_final < z_initial * 1.05, \
+            f"Enstrophy should not grow in decaying flow: " \
+            f"initial={z_initial:.6f}, final={z_final:.6f}"
+
+
+class TestVortexDecayProperties:
+    """Test vortex decay and preservation properties.
+
+    These tests check whether the solver correctly captures the decay of
+    vortical structures and doesn't introduce spurious diffusion.
+    """
+
+    def test_peak_vorticity_decays_monotonically(self, engine):
+        """Peak vorticity magnitude should decrease during free decay.
+
+        Numerical diffusion causes faster-than-physical vorticity decay.
+        Here we just check it decays monotonically (no oscillations or growth).
+        """
+        nx, ny = 32, 32
+        engine.create(nx=nx, ny=ny, lx=1.0, ly=1.0, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=100)
+
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=2)
+
+        vort = engine.get_field("vorticity")["data"]
+        prev_peak = max(abs(vort[j][i]) for j in range(ny) for i in range(nx))
+
+        for interval in range(5):
+            engine.step(dt=0.005, steps=10)
+            vort = engine.get_field("vorticity")["data"]
+            peak = max(abs(vort[j][i]) for j in range(ny) for i in range(nx))
+            assert peak < prev_peak * 1.05, \
+                f"Interval {interval}: peak |ω| grew from {prev_peak:.4f} to {peak:.4f}"
+            prev_peak = peak
+
+    def test_vorticity_decay_rate_bounded_by_viscosity(self, engine):
+        """Peak vorticity shouldn't decay much faster than the viscous time scale.
+
+        For a vortex with characteristic size L and viscosity ν, the decay
+        time scale is τ ~ L²/ν. Over time T << τ, the peak vorticity should
+        retain most of its value. Excessive numerical diffusion would cause
+        much faster decay.
+        """
+        nx, ny = 48, 48
+        lx, ly = 1.0, 1.0
+        nu = 0.01
+
+        engine.create(nx=nx, ny=ny, lx=lx, ly=ly, viscosity=nu)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=200)
+
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=2)
+
+        diag_initial = engine.get_diagnostics()
+        ke_initial = diag_initial["kinetic_energy"]
+
+        # Evolve for T = 0.5 time units
+        # Viscous time scale τ = L²/ν = 1/0.01 = 100
+        # So T/τ = 0.005 — should retain most of the energy
+        engine.step(dt=0.005, steps=100)
+
+        diag_final = engine.get_diagnostics()
+        ke_final = diag_final["kinetic_energy"]
+
+        # Should retain at least 50% of energy over this short time
+        # (purely viscous decay: exp(-2ν k² T) ≈ exp(-0.01*T) for k=1)
+        # With T=0.5: retention ≈ exp(-0.005) ≈ 0.995 for the lowest mode
+        # Actual cavity flow has higher modes that decay faster, so ~70-90% expected
+        retention = ke_final / ke_initial if ke_initial > 1e-10 else 0
+        assert retention > 0.3, \
+            f"Energy retention = {retention:.3f} over T=0.5 is too low — " \
+            f"excessive numerical dissipation (expected > 0.3)"

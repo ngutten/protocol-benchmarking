@@ -31,64 +31,140 @@ from .token_usage import get_session_token_usage
 
 app = FastAPI()
 
-# Global experiment state (single-user server)
-state = {
-    "experiment": None,
-    "current_stage_idx": -1,
-    "stages": [],
-    "stage_metrics": [],
-    "pty_fd": None,
-    "child_pid": None,
-    "stage_start_time": None,
-    "presence_segments": [],
-    "presence_status": "active",
-    "presence_segment_start": None,
-    "paused": False,
-    "protocol": None,
-    "auto_mode": False,
-    "auto_advance": False,
-    "auto_status": None,       # None, "running", "completing", "advancing"
-    "pty_monitor_task": None,  # asyncio.Task for PTY exit monitoring
-    "pty_generation": 0,       # incremented each time a new PTY is spawned
-    # Deferred init fields
+# ---------------------------------------------------------------------------
+# Per-session state
+# ---------------------------------------------------------------------------
+
+class RunSession:
+    """Holds all state for a single benchmark run session."""
+
+    def __init__(self, session_id: str, task_dir: str = None, task_name: str = None):
+        self.session_id = session_id
+        self.experiment = None
+        self.current_stage_idx = -1
+        self.stages: list = []
+        self.stage_metrics: list = []
+        self.pty_fd = None
+        self.child_pid = None
+        self.stage_start_time = None
+        self.presence_segments: list = []
+        self.presence_status = "active"
+        self.presence_segment_start = None
+        self.paused = False
+        self.protocol = None
+        self.auto_mode = False
+        self.auto_advance = False
+        self.auto_status = None       # None, "running", "completing", "advancing"
+        self.pty_monitor_task = None   # asyncio.Task for PTY exit monitoring
+        self.pty_generation = 0        # incremented each time a new PTY is spawned
+        self.task_dir = task_dir
+        self.current_task_name = task_name
+        self.harness_log: list = []    # circular buffer of harness debug messages
+        self.stage_protocols: dict = {}  # stage_id -> protocol_name for per-stage overrides
+
+    def cleanup(self):
+        """Clean up PTY resources."""
+        if self.pty_monitor_task is not None:
+            self.pty_monitor_task.cancel()
+            self.pty_monitor_task = None
+        if self.child_pid:
+            try:
+                os.kill(self.child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self.child_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            self.child_pid = None
+        if self.pty_fd is not None:
+            try:
+                os.close(self.pty_fd)
+            except OSError:
+                pass
+            self.pty_fd = None
+
+
+# Session registry: session_id -> RunSession
+sessions: dict[str, RunSession] = {}
+
+# Global config (from CLI args, not per-session)
+_global = {
     "task_dir": None,
     "launch_kwargs": {},
     "default_protocol": None,
-    "current_task_name": None,  # e.g. "minidb"
-    "harness_log": [],  # circular buffer of harness debug messages
-    "stage_protocols": {},  # stage_id -> protocol_name for per-stage overrides
+    "current_task_name": None,
+    "harness_log": [],  # global harness log for non-session events
 }
 
 _HARNESS_LOG_MAX = 200
 
 
-def _harness_log(msg: str):
-    """Append a timestamped message to the harness debug log."""
+def _get_session(session_id: str) -> RunSession:
+    """Look up a session by ID. Returns None if not found."""
+    return sessions.get(session_id)
+
+
+def _remove_session(session_id: str):
+    """Remove a session from the registry and clean up global refs."""
+    sessions.pop(session_id, None)
+    if _global.get("default_session_id") == session_id:
+        _global.pop("default_session_id", None)
+
+
+def _harness_log(msg: str, session: RunSession = None):
+    """Append a timestamped message to a harness debug log."""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     entry = f"[{ts}] {msg}"
-    state["harness_log"].append(entry)
-    if len(state["harness_log"]) > _HARNESS_LOG_MAX:
-        state["harness_log"] = state["harness_log"][-_HARNESS_LOG_MAX:]
+    log = session.harness_log if session else _global["harness_log"]
+    log.append(entry)
+    if len(log) > _HARNESS_LOG_MAX:
+        del log[:-_HARNESS_LOG_MAX]
 
 
 def _find_latest_session_id(workspace_path: str) -> str:
-    """Find the most recent session JSONL file matching the workspace path."""
+    """Find the most recent session JSONL file matching the workspace path.
+
+    Filters by workspace path when possible: Claude encodes project paths
+    as directory names using a dash-separated encoding (slashes become dashes).
+    We try to match the encoded workspace path to narrow the search.
+    """
     claude_dir = Path.home() / ".claude" / "projects"
     if not claude_dir.exists():
         return ""
 
-    # Claude encodes project paths as directory names
+    # Claude encodes project paths: /home/user/foo/bar -> -home-user-foo-bar
+    workspace_abs = str(Path(workspace_path).resolve())
+    encoded_path = workspace_abs.replace("/", "-")
+    if encoded_path.startswith("-"):
+        encoded_path = encoded_path  # keep leading dash
+
     best_file = None
     best_mtime = 0
 
     for dirpath, _, filenames in os.walk(claude_dir):
+        dir_name = Path(dirpath).name
+        # If we can match by encoded workspace path, prefer that
+        matches_workspace = encoded_path and encoded_path in dir_name
+
         for fname in filenames:
             if fname.endswith(".jsonl"):
                 fpath = Path(dirpath) / fname
                 mtime = fpath.stat().st_mtime
-                if mtime > best_mtime:
+                if matches_workspace and mtime > best_mtime:
                     best_mtime = mtime
                     best_file = fpath
+
+    # Fallback: if no workspace-specific match, use most recent globally
+    if not best_file:
+        for dirpath, _, filenames in os.walk(claude_dir):
+            for fname in filenames:
+                if fname.endswith(".jsonl"):
+                    fpath = Path(dirpath) / fname
+                    mtime = fpath.stat().st_mtime
+                    if mtime > best_mtime:
+                        best_mtime = mtime
+                        best_file = fpath
 
     if best_file and best_mtime > (time.time() - 3600):  # within last hour
         return best_file.stem  # filename without .jsonl is the session ID
@@ -99,8 +175,8 @@ def _find_latest_session_id(workspace_path: str) -> str:
 def init_experiment(task_dir: str, protocol_name: str, work_dir: str = None,
                     log_dir: str = None, engine_cmd: str = "python3 minidb.py",
                     model: str = None, run_id: str = None,
-                    stage_protocols: dict = None):
-    """Initialize the experiment and populate global state.
+                    stage_protocols: dict = None) -> RunSession:
+    """Initialize an experiment and return a RunSession.
 
     Args:
         stage_protocols: Optional dict mapping stage_id -> protocol_name for
@@ -145,15 +221,27 @@ def init_experiment(task_dir: str, protocol_name: str, work_dir: str = None,
                             exp._stage_protocols[numbered_sid] = proto_obj
                             break
 
-    state["experiment"] = exp
-    state["stages"] = list(exp.stages)
-    state["current_stage_idx"] = -1
-    state["stage_metrics"] = []
-    state["protocol"] = protocol
-    state["stage_protocols"] = stage_protocols or {}
+    # Create session
+    session = RunSession(
+        session_id=exp.run_id,
+        task_dir=task_dir,
+        task_name=Path(task_dir).name,
+    )
+    session.experiment = exp
+    session.stages = list(exp.stages)
+    session.current_stage_idx = -1
+    session.stage_metrics = []
+    session.protocol = protocol
+    session.stage_protocols = stage_protocols or {}
+
+    # Register in global session registry
+    sessions[session.session_id] = session
+
+    return session
 
 
-def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = False) -> tuple:
+def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = False,
+                      session: RunSession = None) -> tuple:
     """Spawn claude in a PTY. Returns (master_fd, child_pid).
 
     If headless=True, uses `claude -p` so the process exits on completion.
@@ -180,7 +268,7 @@ def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = Fal
     env = os.environ.copy()
     env["TERM"] = "xterm-256color"
 
-    _harness_log(f"spawn: headless={headless} cmd={cmd_parts[0]}...{cmd_parts[1:3]} (prompt {len(prompt)} chars)")
+    _harness_log(f"spawn: headless={headless} cmd={cmd_parts[0]}...{cmd_parts[1:3]} (prompt {len(prompt)} chars)", session)
 
     child_pid, master_fd = pty.fork()
     if child_pid == 0:
@@ -192,34 +280,15 @@ def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = Fal
         return master_fd, child_pid
 
 
-def _kill_pty():
-    """Kill the current PTY process if running."""
-    # Cancel any PTY monitor task
-    if state["pty_monitor_task"] is not None:
-        state["pty_monitor_task"].cancel()
-        state["pty_monitor_task"] = None
-    if state["child_pid"]:
-        try:
-            os.kill(state["child_pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(state["child_pid"], os.WNOHANG)
-        except ChildProcessError:
-            pass
-        state["child_pid"] = None
-    if state["pty_fd"] is not None:
-        try:
-            os.close(state["pty_fd"])
-        except OSError:
-            pass
-        state["pty_fd"] = None
+def _kill_pty(session: RunSession):
+    """Kill the PTY process for a session."""
+    session.cleanup()
 
 
-def _compute_human_time() -> float:
+def _compute_human_time(session: RunSession) -> float:
     """Compute total active human time from presence segments."""
     total = 0.0
-    for seg in state["presence_segments"]:
+    for seg in session.presence_segments:
         if seg["status"] == "active":
             end = seg.get("end", time.time())
             total += end - seg["start"]
@@ -375,18 +444,18 @@ def _migrate_legacy_logs():
     _harness_log("migrate: legacy log migration complete")
 
 
-async def _monitor_pty_exit():
+async def _monitor_pty_exit(session: RunSession):
     """Background task that monitors the child PID for exit.
 
     When the process exits (claude -p finishes), auto-completes the stage
     and optionally auto-advances to the next stage.
     """
-    child_pid = state["child_pid"]
+    child_pid = session.child_pid
     if not child_pid:
-        _harness_log("monitor: no child_pid, exiting")
+        _harness_log("monitor: no child_pid, exiting", session)
         return
 
-    _harness_log(f"monitor: watching PID {child_pid}")
+    _harness_log(f"monitor: watching PID {child_pid}", session)
     loop = asyncio.get_event_loop()
 
     def _wait_for_exit():
@@ -395,152 +464,152 @@ async def _monitor_pty_exit():
             try:
                 pid, exit_status = os.waitpid(child_pid, os.WNOHANG)
                 if pid != 0:
-                    _harness_log(f"monitor: PID {child_pid} exited (status={exit_status})")
+                    _harness_log(f"monitor: PID {child_pid} exited (status={exit_status})", session)
                     return exit_status
             except ChildProcessError:
-                _harness_log(f"monitor: PID {child_pid} already reaped")
+                _harness_log(f"monitor: PID {child_pid} already reaped", session)
                 return 0
             time.sleep(0.25)
 
     try:
         await loop.run_in_executor(None, _wait_for_exit)
     except asyncio.CancelledError:
-        _harness_log("monitor: cancelled")
+        _harness_log("monitor: cancelled", session)
         return
 
     # Brief delay for final PTY output to flush
     await asyncio.sleep(0.5)
 
     # Auto-complete the stage (check it hasn't been manually completed already)
-    if state["current_stage_idx"] < 0:
-        _harness_log("monitor: stage already completed (manual or race), skipping auto-complete")
+    if session.current_stage_idx < 0:
+        _harness_log("monitor: stage already completed (manual or race), skipping auto-complete", session)
         return
 
-    await _auto_complete_stage()
+    await _auto_complete_stage(session)
 
     # Auto-advance if enabled
-    if state["auto_advance"]:
-        await _auto_start_next_stage()
+    if session.auto_advance:
+        await _auto_start_next_stage(session)
 
 
-async def _auto_complete_stage():
+async def _auto_complete_stage(session: RunSession):
     """Programmatically complete the current stage (same logic as POST /api/stage/complete)."""
-    exp = state["experiment"]
-    if exp is None or state["current_stage_idx"] < 0:
-        _harness_log(f"auto_complete: skipped (exp={exp is not None}, idx={state['current_stage_idx']})")
+    exp = session.experiment
+    if exp is None or session.current_stage_idx < 0:
+        _harness_log(f"auto_complete: skipped (exp={exp is not None}, idx={session.current_stage_idx})", session)
         return
 
-    stage_id = state["stages"][state["current_stage_idx"]]
-    _harness_log(f"auto_complete: starting for stage {stage_id} (idx={state['current_stage_idx']})")
-    state["auto_status"] = "completing"
+    stage_id = session.stages[session.current_stage_idx]
+    _harness_log(f"auto_complete: starting for stage {stage_id} (idx={session.current_stage_idx})", session)
+    session.auto_status = "completing"
 
     # Close presence segment
-    if state["presence_segments"]:
-        state["presence_segments"][-1]["end"] = time.time()
+    if session.presence_segments:
+        session.presence_segments[-1]["end"] = time.time()
 
-    human_time = _compute_human_time()
-    wall_time = time.time() - state["stage_start_time"] if state["stage_start_time"] else human_time
+    human_time = _compute_human_time(session)
+    wall_time = time.time() - session.stage_start_time if session.stage_start_time else human_time
 
     # Don't kill PTY here — process already exited, just clean up fd
     # Clear the child_pid since the process already exited (waitpid was done in monitor)
-    state["child_pid"] = None
-    state["pty_monitor_task"] = None
-    if state["pty_fd"] is not None:
+    session.child_pid = None
+    session.pty_monitor_task = None
+    if session.pty_fd is not None:
         try:
-            os.close(state["pty_fd"])
+            os.close(session.pty_fd)
         except OSError:
             pass
-        state["pty_fd"] = None
+        session.pty_fd = None
 
-    # Find session ID from recent JSONL files
-    session_id = _find_latest_session_id(str(exp.work_dir))
+    # Find claude session ID from recent JSONL files
+    claude_session_id = _find_latest_session_id(str(exp.work_dir))
 
     # Get token usage
     token_data = None
-    if session_id:
-        usage = get_session_token_usage(session_id)
+    if claude_session_id:
+        usage = get_session_token_usage(claude_session_id)
         if usage["total_tokens"] > 0:
             token_data = usage
 
     # Complete stage via experiment
-    _harness_log(f"auto_complete: running metrics for {stage_id} (session={session_id}, tokens={token_data.get('total_tokens', 0) if token_data else 0})")
+    _harness_log(f"auto_complete: running metrics for {stage_id} (claude_session={claude_session_id}, tokens={token_data.get('total_tokens', 0) if token_data else 0})", session)
     try:
         metrics = exp.complete_stage(stage_id, human_time=human_time, wall_time=wall_time, token_data=token_data)
         metrics_dict = metrics.to_dict()
     except Exception as e:
-        _harness_log(f"auto_complete: ERROR in complete_stage: {e}")
-        state["auto_status"] = None
-        state["current_stage_idx"] = -1
+        _harness_log(f"auto_complete: ERROR in complete_stage: {e}", session)
+        session.auto_status = None
+        session.current_stage_idx = -1
         return
 
-    state["stage_metrics"].append(metrics_dict)
-    state["current_stage_idx"] = -1
-    state["auto_status"] = None
-    _harness_log(f"auto_complete: done for {stage_id} (train={metrics_dict.get('training_tests_passed')}/{metrics_dict.get('training_tests_total')})")
+    session.stage_metrics.append(metrics_dict)
+    session.current_stage_idx = -1
+    session.auto_status = None
+    _harness_log(f"auto_complete: done for {stage_id} (train={metrics_dict.get('training_tests_passed')}/{metrics_dict.get('training_tests_total')})", session)
 
     # Auto-save log and consolidate
     exp.save_log()
     _consolidate_log(exp)
 
 
-async def _auto_start_next_stage():
+async def _auto_start_next_stage(session: RunSession):
     """Programmatically start the next stage after a brief delay."""
-    exp = state["experiment"]
+    exp = session.experiment
     if not exp:
-        _harness_log("auto_advance: no experiment")
+        _harness_log("auto_advance: no experiment", session)
         return
 
-    next_idx = len(state["stage_metrics"])
-    if next_idx >= len(state["stages"]):
-        _harness_log("auto_advance: all stages complete")
-        state["auto_status"] = None
+    next_idx = len(session.stage_metrics)
+    if next_idx >= len(session.stages):
+        _harness_log("auto_advance: all stages complete", session)
+        session.auto_status = None
         return
 
-    _harness_log(f"auto_advance: waiting 2s before stage {next_idx}")
-    state["auto_status"] = "advancing"
+    _harness_log(f"auto_advance: waiting 2s before stage {next_idx}", session)
+    session.auto_status = "advancing"
     await asyncio.sleep(2)
 
     # Re-check in case user aborted during the delay
-    if not state["auto_mode"] or state["experiment"] is None:
-        _harness_log("auto_advance: aborted during delay")
-        state["auto_status"] = None
+    if not session.auto_mode or session.experiment is None:
+        _harness_log("auto_advance: aborted during delay", session)
+        session.auto_status = None
         return
 
-    next_idx = len(state["stage_metrics"])
-    if next_idx >= len(state["stages"]):
-        _harness_log("auto_advance: all stages complete (after delay)")
-        state["auto_status"] = None
+    next_idx = len(session.stage_metrics)
+    if next_idx >= len(session.stages):
+        _harness_log("auto_advance: all stages complete (after delay)", session)
+        session.auto_status = None
         return
 
-    stage_id = state["stages"][next_idx]
-    _harness_log(f"auto_advance: starting stage {stage_id} (idx={next_idx})")
-    state["current_stage_idx"] = next_idx
+    stage_id = session.stages[next_idx]
+    _harness_log(f"auto_advance: starting stage {stage_id} (idx={next_idx})", session)
+    session.current_stage_idx = next_idx
 
     exp.prepare_stage(stage_id)
     prompt = exp.build_stage_prompt(stage_id)
 
     # Start presence tracking (away in semi-auto mode)
-    state["presence_segments"] = []
-    state["presence_status"] = "away"
-    state["presence_segment_start"] = time.time()
-    state["presence_segments"].append({
+    session.presence_segments = []
+    session.presence_status = "away"
+    session.presence_segment_start = time.time()
+    session.presence_segments.append({
         "start": time.time(), "status": "away"
     })
-    state["stage_start_time"] = time.time()
+    session.stage_start_time = time.time()
 
     # Spawn claude in PTY with headless mode (use per-stage protocol)
-    _kill_pty()
+    _kill_pty(session)
     stage_protocol = exp.get_protocol_for_stage(stage_id)
     master_fd, child_pid = _spawn_claude_pty(
-        str(exp.work_dir), prompt, stage_protocol, headless=True
+        str(exp.work_dir), prompt, stage_protocol, headless=True, session=session
     )
-    state["pty_fd"] = master_fd
-    state["child_pid"] = child_pid
-    state["pty_generation"] += 1
-    state["auto_status"] = "running"
+    session.pty_fd = master_fd
+    session.child_pid = child_pid
+    session.pty_generation += 1
+    session.auto_status = "running"
 
     # Start monitoring for this new stage
-    state["pty_monitor_task"] = asyncio.create_task(_monitor_pty_exit())
+    session.pty_monitor_task = asyncio.create_task(_monitor_pty_exit(session))
 
 
 # ---- API Routes ----
@@ -548,6 +617,25 @@ async def _auto_start_next_stage():
 @app.get("/")
 async def index():
     return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    """List all active sessions."""
+    result = []
+    for sid, s in sessions.items():
+        completed = len([m for m in s.stage_metrics if isinstance(m, dict) and not m.get("skipped")])
+        result.append({
+            "session_id": sid,
+            "task_name": s.current_task_name,
+            "task_dir": s.task_dir,
+            "protocol": s.protocol.name if s.protocol else None,
+            "stages_completed": completed,
+            "stages_total": len(s.stages),
+            "pty_active": s.child_pid is not None,
+            "auto_mode": s.auto_mode,
+        })
+    return {"sessions": result}
 
 
 @app.get("/api/protocols")
@@ -569,7 +657,7 @@ async def get_protocols():
         })
     return {
         "protocols": protocols,
-        "default": state["default_protocol"],
+        "default": _global["default_protocol"],
     }
 
 
@@ -578,43 +666,31 @@ from fastapi import Request as FastAPIRequest
 
 @app.post("/api/task/select")
 async def select_task(request: FastAPIRequest):
-    """Select (or switch) the active task directory."""
+    """Select (or switch) the active task directory for the requesting tab.
+
+    Only cleans up a session if the tab's own session_id is provided.
+    Does NOT modify global state — each tab tracks its own task selection.
+    """
     body = await request.json()
     task_dir = body.get("task_dir")
+    old_session_id = body.get("session_id")
     if not task_dir or not Path(task_dir).is_dir():
         return {"error": f"Invalid task directory: {task_dir}"}
 
-    # If experiment is active, save and consolidate before switching
-    exp = state["experiment"]
-    if exp:
-        try:
-            exp.save_log()
-            _consolidate_log(exp)
-        except Exception:
-            pass
-        _kill_pty()
+    # If an existing session was provided, clean it up
+    if old_session_id and old_session_id in sessions:
+        old_session = sessions[old_session_id]
+        exp = old_session.experiment
+        if exp:
+            try:
+                exp.save_log()
+                _consolidate_log(exp)
+            except Exception:
+                pass
+        _kill_pty(old_session)
+        _remove_session(old_session_id)
 
-    # Reset experiment state
-    state["experiment"] = None
-    state["current_stage_idx"] = -1
-    state["stages"] = []
-    state["stage_metrics"] = []
-    state["pty_fd"] = None
-    state["child_pid"] = None
-    state["pty_monitor_task"] = None
-    state["presence_segments"] = []
-    state["presence_status"] = "active"
-    state["stage_start_time"] = None
-    state["paused"] = False
-    state["auto_mode"] = False
-    state["auto_advance"] = False
-    state["auto_status"] = None
-    state["stage_protocols"] = {}
-
-    # Set new task
-    state["task_dir"] = task_dir
     task_name = Path(task_dir).name
-    state["current_task_name"] = task_name
 
     # Load task config
     cfg = load_task_config(task_dir)
@@ -639,10 +715,14 @@ async def select_task(request: FastAPIRequest):
 
 @app.post("/api/experiment/init")
 async def init_experiment_api(request: FastAPIRequest):
-    """Initialize (or re-initialize) experiment with per-stage protocol assignments."""
+    """Initialize (or re-initialize) experiment with per-stage protocol assignments.
+
+    Returns session_id which must be used in all subsequent API calls.
+    """
     body = await request.json()
     protocol_name = body.get("protocol")
     stage_protocols = body.get("stage_protocols", {})
+    old_session_id = body.get("session_id")
 
     if not protocol_name or protocol_name not in ALL_PROTOCOLS:
         return {"error": f"Invalid protocol: {protocol_name}"}
@@ -652,26 +732,24 @@ async def init_experiment_api(request: FastAPIRequest):
         if pname not in ALL_PROTOCOLS:
             return {"error": f"Invalid protocol for stage {sid}: {pname}"}
 
-    task_dir = state["task_dir"]
+    task_dir = body.get("task_dir") or _global["task_dir"]
     if not task_dir:
         return {"error": "No task directory configured"}
 
-    # Kill any running PTY
-    _kill_pty()
-
-    # Reset stage state
-    state["presence_segments"] = []
-    state["presence_status"] = "active"
-    state["stage_metrics"] = []
-    state["current_stage_idx"] = -1
+    # Clean up old session if re-initializing
+    if old_session_id and old_session_id in sessions:
+        old_session = sessions[old_session_id]
+        _kill_pty(old_session)
+        _remove_session(old_session_id)
 
     # Initialize with stored kwargs
-    kwargs = dict(state["launch_kwargs"])
+    kwargs = dict(_global["launch_kwargs"])
     kwargs["model"] = kwargs.pop("model", None)
-    init_experiment(task_dir, protocol_name, stage_protocols=stage_protocols, **kwargs)
+    session = init_experiment(task_dir, protocol_name, stage_protocols=stage_protocols, **kwargs)
 
-    exp = state["experiment"]
+    exp = session.experiment
     return {
+        "session_id": session.session_id,
         "run_id": exp.run_id,
         "stages": list(exp.stages),
         "protocol": protocol_name,
@@ -683,39 +761,77 @@ async def init_experiment_api(request: FastAPIRequest):
 async def configure_auto(request: FastAPIRequest):
     """Enable or disable semi-auto mode."""
     body = await request.json()
-    state["auto_mode"] = bool(body.get("auto_mode", False))
-    state["auto_advance"] = bool(body.get("auto_advance", state["auto_mode"]))
+    session_id = body.get("session_id")
+    session = _get_session(session_id) if session_id else None
+    if not session:
+        return {"error": "Invalid session_id"}
+    session.auto_mode = bool(body.get("auto_mode", False))
+    session.auto_advance = bool(body.get("auto_advance", session.auto_mode))
     return {
-        "auto_mode": state["auto_mode"],
-        "auto_advance": state["auto_advance"],
+        "auto_mode": session.auto_mode,
+        "auto_advance": session.auto_advance,
     }
 
 
 @app.get("/api/state")
-async def get_state():
-    exp = state["experiment"]
+async def get_state(session_id: str = None):
+    # If no session_id, try the default session (from CLI init).
+    # Consume it so only the first browser tab picks it up.
+    if not session_id and _global.get("default_session_id"):
+        session_id = _global.pop("default_session_id")
+    # NOTE: We intentionally do NOT auto-select a session when there's only
+    # one active.  That caused a second browser tab to silently adopt (and
+    # then destroy) the first tab's session during init.
+    if not session_id:
+        return {
+            "initialized": False,
+            "stages": [],
+            "current_stage_idx": -1,
+            "protocol": None,
+            "model": None,
+            "paused": False,
+            "presence_status": "active",
+            "pty_active": False,
+            "live_stats": None,
+            "cumulative_tokens": 0,
+            "cumulative_human_time": 0,
+            "auto_mode": False,
+            "auto_advance": False,
+            "auto_status": None,
+            "harness_log": _global["harness_log"][-20:],
+            "task_dir": _global["task_dir"],
+            "current_task_name": _global["current_task_name"],
+            "stage_protocols": {},
+            "session_id": None,
+        }
+
+    session = _get_session(session_id)
+    if not session:
+        return {"error": f"Session not found: {session_id}", "initialized": False}
+
+    exp = session.experiment
     stages_info = []
-    for i, sid in enumerate(state["stages"]):
+    for i, sid in enumerate(session.stages):
         info = {"id": sid, "status": "pending"}
-        if i < len(state["stage_metrics"]):
+        if i < len(session.stage_metrics):
             info["status"] = "completed"
-            info["metrics"] = state["stage_metrics"][i]
-        elif i == state["current_stage_idx"]:
+            info["metrics"] = session.stage_metrics[i]
+        elif i == session.current_stage_idx:
             info["status"] = "in_progress"
         stages_info.append(info)
 
     # Compute live stats
     live_stats = None
-    if state["current_stage_idx"] >= 0 and state["stage_start_time"]:
-        wall_elapsed = time.time() - state["stage_start_time"]
-        human_time = _compute_human_time()
+    if session.current_stage_idx >= 0 and session.stage_start_time:
+        wall_elapsed = time.time() - session.stage_start_time
+        human_time = _compute_human_time(session)
         # Try to get live token count
         live_tokens = 0
         if exp:
-            session_id = _find_latest_session_id(str(exp.work_dir))
-            if session_id:
+            claude_session_id = _find_latest_session_id(str(exp.work_dir))
+            if claude_session_id:
                 try:
-                    usage = get_session_token_usage(session_id)
+                    usage = get_session_token_usage(claude_session_id)
                     live_tokens = usage.get("total_tokens", 0)
                 except Exception:
                     pass
@@ -727,115 +843,130 @@ async def get_state():
 
     # Cumulative totals from completed stages
     cumulative_tokens = sum(
-        m.get("total_tokens", 0) for m in state["stage_metrics"]
+        m.get("total_tokens", 0) for m in session.stage_metrics
         if isinstance(m, dict) and not m.get("skipped")
     )
     cumulative_human_time = sum(
-        m.get("human_time_seconds", 0) for m in state["stage_metrics"]
+        m.get("human_time_seconds", 0) for m in session.stage_metrics
         if isinstance(m, dict) and not m.get("skipped")
     )
 
     return {
         "initialized": exp is not None,
+        "session_id": session.session_id,
         "stages": stages_info,
-        "current_stage_idx": state["current_stage_idx"],
-        "protocol": state["protocol"].name if state["protocol"] else None,
-        "model": state["protocol"].model if state["protocol"] else None,
-        "paused": state["paused"],
-        "presence_status": state["presence_status"],
-        "pty_active": state["child_pid"] is not None,
+        "current_stage_idx": session.current_stage_idx,
+        "protocol": session.protocol.name if session.protocol else None,
+        "model": session.protocol.model if session.protocol else None,
+        "paused": session.paused,
+        "presence_status": session.presence_status,
+        "pty_active": session.child_pid is not None,
         "live_stats": live_stats,
         "cumulative_tokens": cumulative_tokens,
         "cumulative_human_time": round(cumulative_human_time, 1),
-        "auto_mode": state["auto_mode"],
-        "auto_advance": state["auto_advance"],
-        "auto_status": state["auto_status"],
-        "harness_log": state["harness_log"][-20:],  # last 20 entries for polling
-        "task_dir": state["task_dir"],
-        "current_task_name": state["current_task_name"],
-        "stage_protocols": state.get("stage_protocols", {}),
+        "auto_mode": session.auto_mode,
+        "auto_advance": session.auto_advance,
+        "auto_status": session.auto_status,
+        "harness_log": session.harness_log[-20:],
+        "task_dir": session.task_dir,
+        "current_task_name": session.current_task_name,
+        "stage_protocols": session.stage_protocols,
     }
 
 
 @app.get("/api/harness-log")
-async def get_harness_log():
+async def get_harness_log(session_id: str = None):
     """Return the full harness debug log."""
-    return {"log": state["harness_log"]}
+    if session_id:
+        session = _get_session(session_id)
+        if session:
+            return {"log": session.harness_log}
+    return {"log": _global["harness_log"]}
 
 
 @app.post("/api/stage/start")
-async def start_stage():
-    exp = state["experiment"]
+async def start_stage(request: FastAPIRequest):
+    body = await request.json()
+    session_id = body.get("session_id")
+    session = _get_session(session_id) if session_id else None
+    if not session:
+        return {"error": "Invalid session_id"}
+    exp = session.experiment
     if not exp:
         return {"error": "No experiment initialized"}
 
-    next_idx = len(state["stage_metrics"])
-    if next_idx >= len(state["stages"]):
+    next_idx = len(session.stage_metrics)
+    if next_idx >= len(session.stages):
         return {"error": "All stages completed"}
 
-    stage_id = state["stages"][next_idx]
-    _harness_log(f"start_stage: {stage_id} (idx={next_idx}, auto={state['auto_mode']})")
-    state["current_stage_idx"] = next_idx
+    stage_id = session.stages[next_idx]
+    _harness_log(f"start_stage: {stage_id} (idx={next_idx}, auto={session.auto_mode})", session)
+    session.current_stage_idx = next_idx
 
     exp.prepare_stage(stage_id)
     prompt = exp.build_stage_prompt(stage_id)
 
     # Start presence tracking (away by default in semi-auto mode)
-    initial_presence = "away" if state["auto_mode"] else "active"
-    state["presence_segments"] = []
-    state["presence_status"] = initial_presence
-    state["presence_segment_start"] = time.time()
-    state["presence_segments"].append({
+    initial_presence = "away" if session.auto_mode else "active"
+    session.presence_segments = []
+    session.presence_status = initial_presence
+    session.presence_segment_start = time.time()
+    session.presence_segments.append({
         "start": time.time(), "status": initial_presence
     })
-    state["stage_start_time"] = time.time()
+    session.stage_start_time = time.time()
 
     # Spawn claude in PTY (use per-stage protocol if available)
-    _kill_pty()
-    headless = state["auto_mode"]
+    _kill_pty(session)
+    headless = session.auto_mode
     stage_protocol = exp.get_protocol_for_stage(stage_id)
     master_fd, child_pid = _spawn_claude_pty(
-        str(exp.work_dir), prompt, stage_protocol, headless=headless
+        str(exp.work_dir), prompt, stage_protocol, headless=headless, session=session
     )
-    state["pty_fd"] = master_fd
-    state["child_pid"] = child_pid
-    state["pty_generation"] += 1
+    session.pty_fd = master_fd
+    session.child_pid = child_pid
+    session.pty_generation += 1
 
     # In auto mode, start monitoring for process exit
     if headless:
-        state["auto_status"] = "running"
-        state["pty_monitor_task"] = asyncio.create_task(_monitor_pty_exit())
+        session.auto_status = "running"
+        session.pty_monitor_task = asyncio.create_task(_monitor_pty_exit(session))
 
-    return {"stage_id": stage_id, "stage_idx": next_idx, "prompt": prompt}
+    return {"session_id": session.session_id, "stage_id": stage_id, "stage_idx": next_idx, "prompt": prompt}
 
 
 @app.post("/api/stage/complete")
-async def complete_stage():
-    exp = state["experiment"]
-    if exp is None or state["current_stage_idx"] < 0:
-        _harness_log(f"complete_stage: rejected (exp={exp is not None}, idx={state['current_stage_idx']}, auto_status={state['auto_status']})")
+async def complete_stage(request: FastAPIRequest):
+    body = await request.json()
+    session_id = body.get("session_id")
+    session = _get_session(session_id) if session_id else None
+    if not session:
+        return {"error": "Invalid session_id"}
+    exp = session.experiment
+    if exp is None or session.current_stage_idx < 0:
+        _harness_log(f"complete_stage: rejected (exp={exp is not None}, idx={session.current_stage_idx}, auto_status={session.auto_status})", session)
         return {"error": "No stage in progress"}
 
-    stage_id = state["stages"][state["current_stage_idx"]]
-    _harness_log(f"complete_stage: manual complete for {stage_id}")
+    stage_id = session.stages[session.current_stage_idx]
+    _harness_log(f"complete_stage: manual complete for {stage_id}", session)
 
     # Close presence segment
-    if state["presence_segments"]:
-        state["presence_segments"][-1]["end"] = time.time()
+    if session.presence_segments:
+        session.presence_segments[-1]["end"] = time.time()
 
-    human_time = _compute_human_time()
-    wall_time = time.time() - state["stage_start_time"] if state["stage_start_time"] else human_time
+    human_time = _compute_human_time(session)
+    wall_time = time.time() - session.stage_start_time if session.stage_start_time else human_time
 
     # Kill PTY
-    _kill_pty()
+    _kill_pty(session)
 
-    # Find session ID from recent JSONL files
-    session_id = _find_latest_session_id(str(exp.work_dir))
+    # Find claude session ID from recent JSONL files
+    claude_session_id = _find_latest_session_id(str(exp.work_dir))
 
     # Get token usage
     token_data = None
-    if session_id:
-        usage = get_session_token_usage(session_id)
+    if claude_session_id:
+        usage = get_session_token_usage(claude_session_id)
         if usage["total_tokens"] > 0:
             token_data = usage
 
@@ -843,8 +974,8 @@ async def complete_stage():
     metrics = exp.complete_stage(stage_id, human_time=human_time, wall_time=wall_time, token_data=token_data)
     metrics_dict = metrics.to_dict()
 
-    state["stage_metrics"].append(metrics_dict)
-    state["current_stage_idx"] = -1
+    session.stage_metrics.append(metrics_dict)
+    session.current_stage_idx = -1
 
     # Auto-save log and consolidate
     exp.save_log()
@@ -854,49 +985,66 @@ async def complete_stage():
 
 
 @app.post("/api/stage/skip")
-async def skip_stage():
-    exp = state["experiment"]
+async def skip_stage(request: FastAPIRequest):
+    body = await request.json()
+    session_id = body.get("session_id")
+    session = _get_session(session_id) if session_id else None
+    if not session:
+        return {"error": "Invalid session_id"}
+    exp = session.experiment
     if not exp:
         return {"error": "No experiment initialized"}
 
-    next_idx = state["current_stage_idx"] if state["current_stage_idx"] >= 0 else len(state["stage_metrics"])
-    if next_idx >= len(state["stages"]):
+    next_idx = session.current_stage_idx if session.current_stage_idx >= 0 else len(session.stage_metrics)
+    if next_idx >= len(session.stages):
         return {"error": "All stages completed"}
 
-    _kill_pty()
-    stage_id = state["stages"][next_idx]
-    state["stage_metrics"].append({"stage_id": stage_id, "skipped": True})
-    state["current_stage_idx"] = -1
+    _kill_pty(session)
+    stage_id = session.stages[next_idx]
+    session.stage_metrics.append({"stage_id": stage_id, "skipped": True})
+    session.current_stage_idx = -1
     exp.completed_stages.append(stage_id)
     return {"stage_id": stage_id, "skipped": True}
 
 
 @app.post("/api/presence/toggle")
-async def toggle_presence():
+async def toggle_presence(request: FastAPIRequest):
+    body = await request.json()
+    session_id = body.get("session_id")
+    session = _get_session(session_id) if session_id else None
+    if not session:
+        return {"error": "Invalid session_id"}
     now = time.time()
-    if state["presence_segments"]:
-        state["presence_segments"][-1]["end"] = now
+    if session.presence_segments:
+        session.presence_segments[-1]["end"] = now
 
-    new_status = "away" if state["presence_status"] == "active" else "active"
-    state["presence_status"] = new_status
-    state["presence_segments"].append({"start": now, "status": new_status})
+    new_status = "away" if session.presence_status == "active" else "active"
+    session.presence_status = new_status
+    session.presence_segments.append({"start": now, "status": new_status})
     return {"status": new_status}
 
 
 @app.post("/api/experiment/abort")
-async def abort_experiment():
-    _kill_pty()
-    exp = state["experiment"]
+async def abort_experiment(request: FastAPIRequest):
+    body = await request.json()
+    session_id = body.get("session_id")
+    session = _get_session(session_id) if session_id else None
+    if not session:
+        return {"error": "Invalid session_id"}
+    _kill_pty(session)
+    exp = session.experiment
     if exp:
         exp.save_log()
         _consolidate_log(exp)
+    # Remove from registry
+    _remove_session(session_id)
     return {"aborted": True}
 
 
 @app.get("/api/tree")
 async def get_tree(task: str = None):
     """Return the experiment state tree, optionally per-task."""
-    task_name = task or state.get("current_task_name")
+    task_name = task or _global.get("current_task_name")
     if task_name:
         log_dir = _task_log_dir(task_name)
     else:
@@ -910,7 +1058,7 @@ async def get_tree(task: str = None):
 @app.get("/api/pipelines")
 async def get_pipelines():
     """Return available pipelines for the current task."""
-    task_dir = state.get("task_dir")
+    task_dir = _global.get("task_dir")
     if not task_dir:
         return {"pipelines": {}}
     cfg = load_task_config(task_dir)
@@ -920,7 +1068,7 @@ async def get_pipelines():
 @app.get("/api/comparisons/available")
 async def get_available_comparisons(task: str = None):
     """Return computable and missing differential comparisons."""
-    task_name = task or state.get("current_task_name")
+    task_name = task or _global.get("current_task_name")
     if task_name:
         log_dir = _task_log_dir(task_name)
     else:
@@ -931,7 +1079,7 @@ async def get_available_comparisons(task: str = None):
     available = tree.list_available_comparisons()
 
     # Determine what's missing based on task pipelines
-    task_dir = state.get("task_dir")
+    task_dir = _global.get("task_dir")
     missing = []
     if task_dir:
         cfg = load_task_config(task_dir)
@@ -944,26 +1092,33 @@ async def get_available_comparisons(task: str = None):
 
 @app.post("/api/experiment/fork")
 async def fork_experiment(request: FastAPIRequest):
-    """Initialize a new experiment forked from an existing tree node."""
+    """Initialize a new experiment forked from an existing tree node.
+
+    Returns a new session_id for the forked experiment.
+    """
     body = await request.json()
     node_id = body.get("node_id")
     protocol_name = body.get("protocol")
     pipeline_name = body.get("pipeline")
     slots = body.get("slots", {})
+    old_session_id = body.get("session_id")
 
     if not node_id:
         return {"error": "node_id is required"}
     if not protocol_name or protocol_name not in ALL_PROTOCOLS:
         return {"error": f"Invalid protocol: {protocol_name}"}
 
-    task_dir = state["task_dir"]
+    task_dir = body.get("task_dir") or _global["task_dir"]
     if not task_dir:
         return {"error": "No task directory configured"}
 
-    _kill_pty()
+    # Clean up old session if provided
+    if old_session_id and old_session_id in sessions:
+        _kill_pty(sessions[old_session_id])
+        _remove_session(old_session_id)
 
     protocol = ALL_PROTOCOLS[protocol_name]
-    kwargs = dict(state["launch_kwargs"])
+    kwargs = dict(_global["launch_kwargs"])
     model = kwargs.pop("model", None)
     if model:
         protocol.model = model
@@ -982,38 +1137,48 @@ async def fork_experiment(request: FastAPIRequest):
     )
     exp.setup(fork_from_node=node_id)
 
-    state["experiment"] = exp
-    state["stages"] = exp.get_pipeline_stages_list() if pipeline_name else list(exp.stages)
-    state["current_stage_idx"] = -1
-    state["stage_metrics"] = []
-    state["protocol"] = protocol
-    state["presence_segments"] = []
-    state["presence_status"] = "active"
+    session = RunSession(
+        session_id=exp.run_id,
+        task_dir=task_dir,
+        task_name=Path(task_dir).name,
+    )
+    session.experiment = exp
+    session.stages = exp.get_pipeline_stages_list() if pipeline_name else list(exp.stages)
+    session.current_stage_idx = -1
+    session.stage_metrics = []
+    session.protocol = protocol
+    session.presence_segments = []
+    session.presence_status = "active"
 
     # Mark forked stages as completed in metrics list
     for sid in exp.completed_stages:
-        state["stage_metrics"].append({"stage_id": sid, "skipped": True, "forked": True})
+        session.stage_metrics.append({"stage_id": sid, "skipped": True, "forked": True})
+
+    # Register session
+    sessions[session.session_id] = session
 
     return {
+        "session_id": session.session_id,
         "run_id": exp.run_id,
-        "stages": state["stages"],
+        "stages": session.stages,
         "protocol": protocol_name,
         "forked_from": node_id,
         "completed_stages": list(exp.completed_stages),
     }
 
 
-@app.websocket("/ws/terminal")
-async def terminal_ws(ws: WebSocket):
-    """WebSocket bridge between xterm.js and the PTY.
+@app.websocket("/ws/terminal/{session_id}")
+async def terminal_ws(ws: WebSocket, session_id: str):
+    """WebSocket bridge between xterm.js and the PTY for a specific session.
 
-    Reads from state["pty_fd"] dynamically so it survives stage transitions.
+    Reads from session.pty_fd dynamically so it survives stage transitions.
     When a PTY closes (process exit), waits briefly for a new PTY to appear
     (e.g. from auto-advance) instead of immediately disconnecting.
     """
     await ws.accept()
 
-    if state["pty_fd"] is None:
+    session = _get_session(session_id)
+    if not session or session.pty_fd is None:
         await ws.send_text("\r\nNo terminal session active. Click 'Start Stage' first.\r\n")
         await ws.close()
         return
@@ -1021,9 +1186,9 @@ async def terminal_ws(ws: WebSocket):
     async def _notify_stage_transition(new_gen):
         """Send a stage transition banner to the terminal."""
         try:
-            stage_idx = state["current_stage_idx"]
-            if stage_idx >= 0 and stage_idx < len(state["stages"]):
-                stage_id = state["stages"][stage_idx]
+            stage_idx = session.current_stage_idx
+            if stage_idx >= 0 and stage_idx < len(session.stages):
+                stage_id = session.stages[stage_idx]
                 await ws.send_text(f"\r\n\x1b[1;36m--- Starting stage: {stage_id} ---\x1b[0m\r\n\r\n")
         except (WebSocketDisconnect, OSError):
             pass
@@ -1031,19 +1196,19 @@ async def terminal_ws(ws: WebSocket):
     async def read_pty():
         """Read from PTY and send to WebSocket, following fd changes across stages."""
         loop = asyncio.get_event_loop()
-        current_fd = state["pty_fd"]
-        current_gen = state["pty_generation"]
+        current_fd = session.pty_fd
+        current_gen = session.pty_generation
         try:
             while True:
                 # Check if a new PTY generation appeared
-                if state["pty_generation"] > current_gen and state["pty_fd"] is not None:
-                    current_fd = state["pty_fd"]
-                    current_gen = state["pty_generation"]
+                if session.pty_generation > current_gen and session.pty_fd is not None:
+                    current_fd = session.pty_fd
+                    current_gen = session.pty_generation
                     await _notify_stage_transition(current_gen)
 
-                if current_fd is None or state["pty_fd"] is None:
+                if current_fd is None or session.pty_fd is None:
                     # PTY closed — wait for a new one (auto-advance) or give up
-                    new_fd, new_gen = await _wait_for_new_pty(current_gen)
+                    new_fd, new_gen = await _wait_for_new_pty(session, current_gen)
                     if new_fd is None:
                         await ws.send_text("\r\n[Process exited]\r\n")
                         break
@@ -1056,7 +1221,7 @@ async def terminal_ws(ws: WebSocket):
                     data = await loop.run_in_executor(None, _blocking_read_pty, current_fd)
                     if data is None:
                         # EOF — fd is dead. Wait for a replacement.
-                        new_fd, new_gen = await _wait_for_new_pty(current_gen)
+                        new_fd, new_gen = await _wait_for_new_pty(session, current_gen)
                         if new_fd is None:
                             await ws.send_text("\r\n[Process exited]\r\n")
                             break
@@ -1068,9 +1233,6 @@ async def terminal_ws(ws: WebSocket):
                 except (OSError, WebSocketDisconnect):
                     break
         finally:
-            # Close the WS so write_pty's ws.receive() also terminates,
-            # allowing asyncio.gather to complete and the handler to exit.
-            # This lets the frontend auto-reconnect detect the dead WS.
             try:
                 await ws.close()
             except Exception:
@@ -1084,8 +1246,8 @@ async def terminal_ws(ws: WebSocket):
                 if data.get("type") == "websocket.disconnect":
                     break
                 payload = data.get("bytes") or (data.get("text", "").encode() if data.get("text") else None)
-                if payload and state["pty_fd"] is not None:
-                    os.write(state["pty_fd"], payload)
+                if payload and session.pty_fd is not None:
+                    os.write(session.pty_fd, payload)
             except (WebSocketDisconnect, OSError):
                 break
 
@@ -1095,35 +1257,36 @@ async def terminal_ws(ws: WebSocket):
         pass
 
 
-async def _wait_for_new_pty(old_gen: int, timeout: float = 60.0):
+async def _wait_for_new_pty(session: RunSession, old_gen: int, timeout: float = 60.0):
     """Wait up to `timeout` seconds for a new PTY generation to appear.
 
     Returns (new_fd, new_gen) or (None, old_gen) if no new PTY appeared.
     Timeout is generous because metrics collection between stages can be slow.
     """
-    if not state["auto_mode"]:
+    if not session.auto_mode:
         return None, old_gen
-    _harness_log(f"ws: waiting for new PTY (gen={old_gen}, timeout={timeout}s)")
+    _harness_log(f"ws: waiting for new PTY (gen={old_gen}, timeout={timeout}s)", session)
     deadline = time.time() + timeout
     while time.time() < deadline:
         await asyncio.sleep(0.3)
-        if state["pty_generation"] > old_gen and state["pty_fd"] is not None:
-            _harness_log(f"ws: PTY gen {old_gen} -> {state['pty_generation']} (fd={state['pty_fd']})")
-            return state["pty_fd"], state["pty_generation"]
-    _harness_log(f"ws: no new PTY after {timeout}s (gen={old_gen})")
+        if session.pty_generation > old_gen and session.pty_fd is not None:
+            _harness_log(f"ws: PTY gen {old_gen} -> {session.pty_generation} (fd={session.pty_fd})", session)
+            return session.pty_fd, session.pty_generation
+    _harness_log(f"ws: no new PTY after {timeout}s (gen={old_gen})", session)
     return None, old_gen
 
 
-@app.websocket("/ws/resize")
-async def resize_ws(ws: WebSocket):
-    """Receive terminal resize events."""
+@app.websocket("/ws/resize/{session_id}")
+async def resize_ws(ws: WebSocket, session_id: str):
+    """Receive terminal resize events for a specific session."""
     await ws.accept()
+    session = _get_session(session_id)
     while True:
         try:
             data = await ws.receive_json()
-            if state["pty_fd"] is not None:
+            if session and session.pty_fd is not None:
                 winsize = struct.pack("HHHH", data["rows"], data["cols"], 0, 0)
-                fcntl.ioctl(state["pty_fd"], termios.TIOCSWINSZ, winsize)
+                fcntl.ioctl(session.pty_fd, termios.TIOCSWINSZ, winsize)
         except (WebSocketDisconnect, OSError, KeyError):
             break
 
@@ -1857,6 +2020,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   let currentTaskName = null;
   let tasksData = {};
   let currentTaskStages = [];  // stage IDs for the selected task
+  let currentSessionId = null; // session ID for the active experiment
 
   // Visualization state
   let vizChart = null;
@@ -1922,8 +2086,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         select.appendChild(opt);
       });
       // Pre-select if task was set via CLI
-      const stateRes = await fetch('/api/state');
+      const stateRes = await fetch('/api/state' + (currentSessionId ? '?session_id=' + encodeURIComponent(currentSessionId) : ''));
       const stateData = await stateRes.json();
+      // Pick up session_id from server if initialized via CLI
+      if (stateData.session_id && !currentSessionId) {
+        currentSessionId = stateData.session_id;
+      }
       if (stateData.task_dir) {
         select.value = stateData.task_dir;
         currentTaskName = stateData.current_task_name || null;
@@ -1957,8 +2125,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const res = await fetch('/api/task/select', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({task_dir: taskDir}),
+        body: JSON.stringify({task_dir: taskDir, session_id: currentSessionId}),
       });
+      currentSessionId = null; // reset session on task switch
       const data = await res.json();
       if (data.error) {
         term.writeln('Error selecting task: ' + data.error);
@@ -2122,7 +2291,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const res = await fetch('/api/experiment/init', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({protocol: firstProtocol, stage_protocols: stageProtocols}),
+      body: JSON.stringify({protocol: firstProtocol, stage_protocols: stageProtocols, session_id: currentSessionId, task_dir: document.getElementById('task-select').value}),
     });
     const data = await res.json();
     document.getElementById('btn-init').disabled = false;
@@ -2131,7 +2300,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       term.writeln('Error: ' + data.error);
       return;
     }
-    term.writeln(`Run ID: ${data.run_id}`);
+    currentSessionId = data.session_id;
+    term.writeln(`Run ID: ${data.run_id} (session: ${data.session_id})`);
     term.writeln(`Stages: ${data.stages.join(', ')}\\r\\n`);
     term.writeln('Click "Start Stage" to begin.\\r\\n');
     refreshState();
@@ -2140,7 +2310,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   function connectTerminal() {
     if (termWs) { try { termWs.close(); } catch(e) {} }
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    termWs = new WebSocket(`${proto}://${location.host}/ws/terminal`);
+    termWs = new WebSocket(`${proto}://${location.host}/ws/terminal/${currentSessionId}`);
     termWs.binaryType = 'arraybuffer';
     termWs.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) {
@@ -2163,7 +2333,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     // Resize WebSocket
     if (resizeWs) { try { resizeWs.close(); } catch(e) {} }
-    resizeWs = new WebSocket(`${proto}://${location.host}/ws/resize`);
+    resizeWs = new WebSocket(`${proto}://${location.host}/ws/resize/${currentSessionId}`);
     const sendResize = () => {
       if (resizeWs && resizeWs.readyState === WebSocket.OPEN) {
         resizeWs.send(JSON.stringify({rows: term.rows, cols: term.cols}));
@@ -2177,8 +2347,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   async function refreshState() {
     try {
-      const res = await fetch('/api/state');
+      const url = '/api/state' + (currentSessionId ? '?session_id=' + encodeURIComponent(currentSessionId) : '');
+      const res = await fetch(url);
       const data = await res.json();
+      // Pick up session_id from server (e.g. CLI-initialized)
+      if (data.session_id && !currentSessionId) {
+        currentSessionId = data.session_id;
+      }
+
+      // If session was deleted server-side, reset so we stop polling a dead session
+      if (data.error && currentSessionId) {
+        currentSessionId = null;
+        return;
+      }
 
       // Header info
       if (data.initialized) {
@@ -2198,7 +2379,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const list = document.getElementById('stage-list');
       list.innerHTML = '';
       const stageProtos = data.stage_protocols || {};
-      data.stages.forEach((s) => {
+      (data.stages || []).forEach((s) => {
         const div = document.createElement('div');
         div.className = 'stage-item ' + s.status;
         let label = s.id.replace(/_/g, ' ');
@@ -2224,7 +2405,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       // Button states
       const hasActive = data.current_stage_idx >= 0;
-      const allDone = data.stages.length > 0 && data.stages.every(s => s.status === 'completed' || s.metrics?.skipped);
+      const stages = data.stages || [];
+      const allDone = stages.length > 0 && stages.every(s => s.status === 'completed' || s.metrics?.skipped);
       document.getElementById('btn-start').disabled = !data.initialized || hasActive || allDone;
       document.getElementById('btn-init')._experimentActive = data.initialized;
       updateInitButton();
@@ -2236,8 +2418,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       btn.className = data.presence_status === 'active' ? 'presence-active' : 'presence-away';
 
       // Live stats
-      const completed = data.stages.filter(s => s.status === 'completed').length;
-      const total = data.stages.length;
+      const completed = stages.filter(s => s.status === 'completed').length;
+      const total = stages.length;
       document.getElementById('stat-stages').textContent = `${completed} / ${total}`;
       document.getElementById('stat-cumul-tokens').textContent = (data.cumulative_tokens || 0).toLocaleString();
       document.getElementById('stat-cumul-human').textContent = formatDuration(data.cumulative_human_time || 0);
@@ -2285,7 +2467,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       // Don't reconnect if WS is CONNECTING (readyState 0) — it's still being set up.
       const wsDead = !termWs || termWs.readyState === WebSocket.CLOSED || termWs.readyState === WebSocket.CLOSING;
       if (data.pty_active && wsDead && data.current_stage_idx >= 0) {
-        const stageId = data.stages[data.current_stage_idx]?.id || '?';
+        const stageId = stages[data.current_stage_idx]?.id || '?';
         term.writeln(`\\r\\n--- Reconnecting to stage: ${stageId} ---\\r\\n`);
         connectTerminal();
       }
@@ -2298,7 +2480,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   async function startStage() {
     term.clear();
-    const res = await fetch('/api/stage/start', {method: 'POST'});
+    const res = await fetch('/api/stage/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: currentSessionId})});
     const data = await res.json();
     if (data.error) { term.writeln('Error: ' + data.error); return; }
     term.writeln(`Starting stage: ${data.stage_id}\\r\\n`);
@@ -2312,7 +2494,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   async function completeStage() {
     document.getElementById('btn-complete').disabled = true;
     term.writeln('\\r\\nCollecting metrics...');
-    const res = await fetch('/api/stage/complete', {method: 'POST'});
+    const res = await fetch('/api/stage/complete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: currentSessionId})});
     const data = await res.json();
     if (data.error) { term.writeln('Error: ' + data.error); return; }
     const m = data.metrics;
@@ -2328,13 +2510,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   async function skipStage() {
-    const res = await fetch('/api/stage/skip', {method: 'POST'});
+    const res = await fetch('/api/stage/skip', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: currentSessionId})});
     await res.json();
     refreshState();
   }
 
   async function togglePresence() {
-    const res = await fetch('/api/presence/toggle', {method: 'POST'});
+    const res = await fetch('/api/presence/toggle', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: currentSessionId})});
     await res.json();
     refreshState();
   }
@@ -2346,7 +2528,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const res = await fetch('/api/auto/configure', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({auto_mode: newMode, auto_advance: newMode}),
+      body: JSON.stringify({auto_mode: newMode, auto_advance: newMode, session_id: currentSessionId}),
     });
     const data = await res.json();
     btn.classList.toggle('active', data.auto_mode);
@@ -2356,8 +2538,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   async function abortExperiment() {
     if (!confirm('Abort the experiment? Progress will be saved.')) return;
-    await fetch('/api/experiment/abort', {method: 'POST'});
+    await fetch('/api/experiment/abort', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: currentSessionId})});
     term.writeln('\\r\\nExperiment aborted. Log saved.');
+    currentSessionId = null;
     refreshState();
   }
 
@@ -2592,7 +2775,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     selectedForkNode = null;
     term.clear();
     term.writeln(`Forking from ${nodeId} with protocol ${protocol}...\\r\\n`);
-    const body = {node_id: nodeId, protocol: protocol};
+    const body = {node_id: nodeId, protocol: protocol, session_id: currentSessionId};
     if (pipeline) body.pipeline = pipeline;
     const res = await fetch('/api/experiment/fork', {
       method: 'POST',
@@ -2601,7 +2784,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     });
     const data = await res.json();
     if (data.error) { term.writeln('Error: ' + data.error); return; }
-    term.writeln(`Forked! Run ID: ${data.run_id}`);
+    currentSessionId = data.session_id;
+    term.writeln(`Forked! Run ID: ${data.run_id} (session: ${data.session_id})`);
     term.writeln(`Completed stages: ${data.completed_stages.join(', ')}`);
     term.writeln(`Remaining stages: ${data.stages.filter(s => !data.completed_stages.includes(s)).join(', ')}\\r\\n`);
     refreshState();
@@ -3747,20 +3931,22 @@ def launch_ui(task_dir: str = None, protocol_name: str = None, host: str = "0.0.
     """Store config for deferred init and start the web server."""
     import uvicorn
 
-    state["task_dir"] = task_dir
-    state["current_task_name"] = Path(task_dir).name if task_dir else None
-    state["launch_kwargs"] = {
+    _global["task_dir"] = task_dir
+    _global["current_task_name"] = Path(task_dir).name if task_dir else None
+    _global["launch_kwargs"] = {
         k: v for k, v in kwargs.items()
         if k in ("engine_cmd", "model", "run_id", "work_dir", "log_dir")
     }
-    state["default_protocol"] = protocol_name
+    _global["default_protocol"] = protocol_name
 
     # Migrate legacy root-level logs into per-task subdirectories
     _migrate_legacy_logs()
 
     # If both task and protocol were provided via CLI, initialize immediately
     if task_dir and protocol_name:
-        init_experiment(task_dir, protocol_name, **state["launch_kwargs"])
+        session = init_experiment(task_dir, protocol_name, **_global["launch_kwargs"])
+        # Store as the default session for tabs that connect without a session_id
+        _global["default_session_id"] = session.session_id
 
     print(f"\n  Experiment UI: http://localhost:{port}\n")
     uvicorn.run(app, host=host, port=port, log_level="warning")

@@ -174,3 +174,110 @@ class TestSteadyNavierStokes:
         engine.set_boundary("right", "no_slip")
         resp = engine.solve_steady(tolerance=1e-6, max_iterations=50000)
         assert resp["converged"] is True
+
+
+class TestDecayingFlow:
+    """Test energy properties of freely decaying flow (no external driving).
+
+    After removing the lid velocity, the flow should lose energy monotonically
+    due to viscous dissipation with no spurious energy production.
+    """
+
+    @staticmethod
+    def _compute_ke(engine, nx, ny, lx, ly):
+        ux = engine.get_field("velocity_x")["data"]
+        uy = engine.get_field("velocity_y")["data"]
+        dx, dy = lx / nx, ly / ny
+        ke = 0.0
+        for j in range(ny):
+            for i in range(nx):
+                ke += 0.5 * (ux[j][i] ** 2 + uy[j][i] ** 2) * dx * dy
+        return ke
+
+    def test_energy_decreases_without_driving(self, engine):
+        """After stopping the lid, KE should strictly decrease at every measurement."""
+        nx, ny, lx, ly = 32, 32, 1.0, 1.0
+        engine.create(nx=nx, ny=ny, lx=lx, ly=ly, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=100)
+
+        # Stop driving
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=1)
+        ke_prev = self._compute_ke(engine, nx, ny, lx, ly)
+        assert ke_prev > 0.001, "Should have significant KE after driving"
+
+        for interval in range(8):
+            engine.step(dt=0.005, steps=5)
+            ke = self._compute_ke(engine, nx, ny, lx, ly)
+            assert ke < ke_prev + 1e-10, \
+                f"Interval {interval}: KE rose from {ke_prev:.8f} to {ke:.8f} — spurious energy production"
+            ke_prev = ke
+
+    def test_significant_energy_lost_during_decay(self, engine):
+        """Decaying flow should lose a significant fraction of its energy."""
+        nx, ny, lx, ly = 32, 32, 1.0, 1.0
+        engine.create(nx=nx, ny=ny, lx=lx, ly=ly, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+        engine.step(dt=0.01, steps=100)
+
+        engine.set_boundary("top", "no_slip")
+        engine.step(dt=0.005, steps=1)
+        ke_initial = self._compute_ke(engine, nx, ny, lx, ly)
+
+        engine.step(dt=0.005, steps=200)
+        ke_final = self._compute_ke(engine, nx, ny, lx, ly)
+
+        # Should have lost at least 50% of energy after 1.0 time units of decay
+        assert ke_final < 0.5 * ke_initial, \
+            f"KE should decay significantly: initial={ke_initial:.6f}, final={ke_final:.6f}"
+
+
+class TestDynamicSymmetry:
+    """Test that symmetric boundary conditions produce symmetric time evolution.
+
+    The lid-driven cavity has left-right symmetry. A correct numerical scheme
+    on a symmetric grid should preserve this symmetry during time stepping.
+    """
+
+    def test_cavity_vy_antisymmetry_during_stepping(self, engine):
+        """v_y should remain antisymmetric about x=0.5 during cavity evolution."""
+        engine.create(nx=32, ny=32, lx=1.0, ly=1.0, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+
+        for batch in range(5):
+            engine.step(dt=0.01, steps=20)
+            v_left = engine.get_value("velocity_y", [0.25, 0.5])["value"]
+            v_right = engine.get_value("velocity_y", [0.75, 0.5])["value"]
+            scale = max(abs(v_left), abs(v_right), 0.01)
+            asym = abs(v_left + v_right) / scale
+            assert asym < 0.1, \
+                f"Step {(batch + 1) * 20}: symmetry broken — " \
+                f"v_y(0.25, 0.5)={v_left:.6f}, v_y(0.75, 0.5)={v_right:.6f}"
+
+    def test_cavity_ux_symmetry_during_stepping(self, engine):
+        """u_x should remain symmetric about x=0.5 during cavity evolution."""
+        engine.create(nx=32, ny=32, lx=1.0, ly=1.0, viscosity=0.01)
+        engine.set_boundary("top", "velocity", value=[1.0, 0.0])
+        engine.set_boundary("bottom", "no_slip")
+        engine.set_boundary("left", "no_slip")
+        engine.set_boundary("right", "no_slip")
+
+        for batch in range(5):
+            engine.step(dt=0.01, steps=20)
+            u_left = engine.get_value("velocity_x", [0.25, 0.5])["value"]
+            u_right = engine.get_value("velocity_x", [0.75, 0.5])["value"]
+            scale = max(abs(u_left), abs(u_right), 0.01)
+            asym = abs(u_left - u_right) / scale
+            assert asym < 0.1, \
+                f"Step {(batch + 1) * 20}: u_x not symmetric — " \
+                f"u(0.25, 0.5)={u_left:.6f}, u(0.75, 0.5)={u_right:.6f}"
