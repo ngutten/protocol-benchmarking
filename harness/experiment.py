@@ -73,7 +73,7 @@ def setup_run_directory(run_id: str, task_dir: str, protocol: ProtocolDef) -> di
     """Create the isolated run directory structure.
 
     Creates:
-        runs/<run_id>/
+        runs/<task_name>/<run_id>/
             workspace/    — isolated working dir for Claude
             results/      — metrics, logs, plots
 
@@ -82,7 +82,8 @@ def setup_run_directory(run_id: str, task_dir: str, protocol: ProtocolDef) -> di
     Returns dict with 'workspace' and 'results' paths.
     """
     task_dir = Path(task_dir)
-    base = Path("runs") / run_id
+    task_name = task_dir.name
+    base = Path("runs") / task_name / run_id
     workspace = base / "workspace"
     results = base / "results"
 
@@ -209,8 +210,8 @@ class Experiment:
         # Load stages (and engine_cmd override) from task.yaml
         self.stages = self._load_stages()
 
-        # Allow task.yaml to override engine_cmd when caller used the default
-        if engine_cmd == "python3 minidb.py" and "engine_cmd" in self.task_cfg:
+        # Allow task.yaml to override engine_cmd when caller used the default or empty
+        if (not engine_cmd or engine_cmd == "python3 minidb.py") and "engine_cmd" in self.task_cfg:
             self.engine_cmd = self.task_cfg["engine_cmd"]
         else:
             self.engine_cmd = engine_cmd
@@ -354,23 +355,40 @@ class Experiment:
             self.git.init()
 
         # Try to find and fetch from the source repo
-        # The source repo is likely in runs/<run_id>/workspace/
+        # The source repo is likely in runs/<task_name>/<run_id>/workspace/
         source_run_id = node.run_id
-        source_workspace = Path("runs")
-        # Search for the workspace that has this tag
+        runs_root = Path("runs")
+        # Search for the workspace that has this tag (check task subdirs)
         found_source = None
-        for run_dir in source_workspace.iterdir() if source_workspace.exists() else []:
-            ws = run_dir / "workspace"
-            if ws.is_dir():
-                try:
-                    result = GitManager(str(ws))
-                    result._run("tag", "-l", git_tag)
-                    tags = result._run("tag", "-l").splitlines()
-                    if git_tag in tags:
-                        found_source = str(ws)
-                        break
-                except RuntimeError:
+        if runs_root.exists():
+            for task_subdir in runs_root.iterdir():
+                if not task_subdir.is_dir():
                     continue
+                # task_subdir could be a task dir (runs/<task>/) or a legacy
+                # flat run dir (runs/<run_id>/). Check both layouts.
+                candidates = []
+                ws_direct = task_subdir / "workspace"
+                if ws_direct.is_dir():
+                    # Legacy flat layout: runs/<run_id>/workspace/
+                    candidates.append(ws_direct)
+                else:
+                    # Per-task layout: runs/<task>/<run_id>/workspace/
+                    for run_dir in task_subdir.iterdir():
+                        ws = run_dir / "workspace"
+                        if ws.is_dir():
+                            candidates.append(ws)
+                for ws in candidates:
+                    try:
+                        result = GitManager(str(ws))
+                        result._run("tag", "-l", git_tag)
+                        tags = result._run("tag", "-l").splitlines()
+                        if git_tag in tags:
+                            found_source = str(ws)
+                            break
+                    except RuntimeError:
+                        continue
+                if found_source:
+                    break
 
         if found_source:
             # Fetch from source and checkout
@@ -562,6 +580,18 @@ class Experiment:
         print(f"  Training: {metrics.training_tests_passed}/{metrics.training_tests_total}")
         print(f"  Holdout:  {metrics.holdout_tests_passed}/{metrics.holdout_tests_total}")
         print(f"  Regression: {metrics.regression_tests_failed}/{metrics.regression_tests_total} failures")
+        if metrics.perf_tests_total > 0:
+            print(f"  Perf:     {metrics.perf_tests_passed}/{metrics.perf_tests_total} benchmarks")
+            mean_dur = metrics.perf_mean_duration()
+            if mean_dur is not None:
+                print(f"  Perf avg: {mean_dur:.4f}s")
+            for pr in metrics.perf_results:
+                pr_dict = pr if isinstance(pr, dict) else pr.__dict__ if hasattr(pr, '__dict__') else {}
+                name = pr_dict.get("name", str(pr))
+                dur = pr_dict.get("duration_seconds", 0)
+                ok = pr_dict.get("passed", True)
+                status = "ok" if ok else "FAIL"
+                print(f"    {name}: {dur:.4f}s [{status}]")
         print(f"  Code: {metrics.code_lines} lines")
         print(f"  Human time: {metrics.human_time_seconds:.0f}s")
         print(f"  Tokens: {metrics.total_tokens} (in={metrics.input_tokens}, out={metrics.output_tokens})")
@@ -617,6 +647,12 @@ class Experiment:
             "stages": [m.to_dict() for m in self.all_metrics],
         }
 
+        # Always save per-stage protocol map (visualizer uses it)
+        if self._stage_protocols:
+            log["stage_protocols"] = {
+                sid: proto.name for sid, proto in self._stage_protocols.items()
+            }
+
         # Add pipeline info if running a pipeline
         if self.pipeline_name:
             pipeline_cfg = self.get_pipeline_config()
@@ -624,10 +660,6 @@ class Experiment:
             log["slots"] = self.slots
             if pipeline_cfg:
                 log["pipeline_config"] = pipeline_cfg
-            # Per-stage protocol map
-            log["stage_protocols"] = {
-                sid: proto.name for sid, proto in self._stage_protocols.items()
-            }
 
         log_path = self.log_dir / f"{self.run_id}.json"
         with open(log_path, "w") as f:

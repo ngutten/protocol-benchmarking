@@ -8,8 +8,9 @@ description: >
 engine_cmd: "python3 plotcurve.py"
 
 domain_tags:
+  - parser
+  - numerical
   - visualization
-  - parsing
   - math
 
 stages:
@@ -18,12 +19,15 @@ stages:
     type: feature_addition
     training_tests: tests/training/test_01_sine_plot.py
     holdout_tests: tests/holdout/test_01_sine_plot_holdout.py
+    perf_tests: tests/perf/test_01_sine_plot_perf.py
 
   - id: latex_functions
     spec: stages/02_latex_functions.md
     type: feature_addition
+    pipeline_tags: [implicit-invalidation]
     training_tests: tests/training/test_02_latex_functions.py
     holdout_tests: tests/holdout/test_02_latex_functions_holdout.py
+    perf_tests: tests/perf/test_02_latex_functions_perf.py
 
 pipelines:
   sequential_full:

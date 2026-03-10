@@ -1,0 +1,116 @@
+name: fluidsim
+title: "FluidSim: 2D Incompressible Fluid Dynamics Engine"
+description: >
+  A 2D incompressible fluid dynamics simulator supporting Stokes and Navier-Stokes
+  equations, complex boundary conditions, immersed boundary obstacles, flow diagnostics,
+  and multigrid solvers. Communicates via JSON protocol over stdin/stdout. Exercises
+  computational physics, numerical methods, and progressive architectural complexity.
+
+engine_cmd: "python3 fluidsim.py"
+
+domain_tags:
+  - stateful
+  - numerical
+  - physics
+  - simulation
+
+stages:
+  - id: stokes_flow
+    spec: stages/01_stokes_flow.md
+    type: feature_addition
+    training_tests: tests/training/test_01_stokes_flow.py
+    holdout_tests: tests/holdout/test_01_stokes_flow_holdout.py
+    perf_tests: tests/perf/test_01_stokes_flow_perf.py
+
+  - id: navier_stokes
+    spec: stages/02_navier_stokes.md
+    type: feature_addition
+    pipeline_tags: [implicit-invalidation]
+    training_tests: tests/training/test_02_navier_stokes.py
+    holdout_tests: tests/holdout/test_02_navier_stokes_holdout.py
+    perf_tests: tests/perf/test_02_navier_stokes_perf.py
+
+  - id: boundary_conditions
+    spec: stages/03_boundary_conditions.md
+    type: feature_addition
+    training_tests: tests/training/test_03_boundary_conditions.py
+    holdout_tests: tests/holdout/test_03_boundary_conditions_holdout.py
+    perf_tests: tests/perf/test_03_boundary_conditions_perf.py
+    parallelizable_with: [diagnostics]
+
+  - id: diagnostics
+    spec: stages/04_diagnostics.md
+    type: feature_addition
+    training_tests: tests/training/test_04_diagnostics.py
+    holdout_tests: tests/holdout/test_04_diagnostics_holdout.py
+    perf_tests: tests/perf/test_04_diagnostics_perf.py
+    parallelizable_with: [boundary_conditions]
+
+  - id: multigrid
+    spec: stages/05_multigrid.md
+    type: feature_addition
+    pipeline_tags: [restructuring]
+    training_tests: tests/training/test_05_multigrid.py
+    holdout_tests: tests/holdout/test_05_multigrid_holdout.py
+    perf_tests: tests/perf/test_05_multigrid_perf.py
+
+pipelines:
+  sequential_full:
+    stages: [stokes_flow, navier_stokes, boundary_conditions, diagnostics, multigrid]
+    differential: sequential
+
+  parallel_bc_diag:
+    stages:
+      - stokes_flow
+      - navier_stokes
+      - parallel: [boundary_conditions, diagnostics]
+    differential: parallel
+    pipeline_tags: [parallel-merge]
+
+  sequential_diff_ab:
+    stages:
+      - {stage: stokes_flow, slot: A}
+      - {stage: navier_stokes, slot: B}
+      - {stage: boundary_conditions, slot: B}
+      - {stage: diagnostics, slot: B}
+      - {stage: multigrid, slot: B}
+    differential: sequential
+
+  roundtrip_translation:
+    stages:
+      - stokes_flow
+      - navier_stokes
+      - boundary_conditions
+      - {translate: {target: "c++"}, id: translate_cpp}
+      - {translate: {target: "python"}, id: translate_back}
+    differential: round_trip
+    compare:
+      before: boundary_conditions
+      after: translate_back
+    pipeline_tags: [round-trip]
+
+  roundtrip_refactor:
+    stages:
+      - stokes_flow
+      - navier_stokes
+      - boundary_conditions
+      - diagnostics
+      - {refactor: {target: "split into separate solver, grid, and boundary modules"}, id: refactor_split}
+      - {refactor: {target: "merge back into single module"}, id: refactor_merge}
+    differential: round_trip
+    compare:
+      before: diagnostics
+      after: refactor_merge
+    pipeline_tags: [round-trip, refactor-then-extend]
+
+  feature_churn:
+    stages:
+      - stokes_flow
+      - navier_stokes
+      - boundary_conditions
+      - {type: removal, target: boundary_conditions, id: remove_bc}
+    differential: round_trip
+    compare:
+      before: navier_stokes
+      after: remove_bc
+    pipeline_tags: [feature-churn]

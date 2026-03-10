@@ -54,7 +54,9 @@ state = {
     "task_dir": None,
     "launch_kwargs": {},
     "default_protocol": None,
+    "current_task_name": None,  # e.g. "minidb"
     "harness_log": [],  # circular buffer of harness debug messages
+    "stage_protocols": {},  # stage_id -> protocol_name for per-stage overrides
 }
 
 _HARNESS_LOG_MAX = 200
@@ -96,8 +98,16 @@ def _find_latest_session_id(workspace_path: str) -> str:
 
 def init_experiment(task_dir: str, protocol_name: str, work_dir: str = None,
                     log_dir: str = None, engine_cmd: str = "python3 minidb.py",
-                    model: str = None, run_id: str = None):
-    """Initialize the experiment and populate global state."""
+                    model: str = None, run_id: str = None,
+                    stage_protocols: dict = None):
+    """Initialize the experiment and populate global state.
+
+    Args:
+        stage_protocols: Optional dict mapping stage_id -> protocol_name for
+            per-stage protocol assignments. If provided, each stage can use
+            a different protocol. The protocol_name arg is used as fallback
+            for any stages not in this mapping.
+    """
     protocol = ALL_PROTOCOLS[protocol_name]
     if model:
         protocol.model = model
@@ -117,11 +127,30 @@ def init_experiment(task_dir: str, protocol_name: str, work_dir: str = None,
     )
     exp.setup()
 
+    # Apply per-stage protocol overrides.
+    # The UI may send un-numbered stage IDs (e.g. "select_where") while the
+    # experiment uses numbered IDs (e.g. "01_select_where"). Map both forms.
+    if stage_protocols:
+        for sid, pname in stage_protocols.items():
+            if pname in ALL_PROTOCOLS:
+                proto_obj = ALL_PROTOCOLS[pname]
+                # Try exact match first
+                if sid in exp.stages:
+                    exp._stage_protocols[sid] = proto_obj
+                else:
+                    # Try to find the numbered version
+                    for numbered_sid in exp.stages:
+                        # numbered_sid is like "01_select_where", sid is "select_where"
+                        if numbered_sid.split('_', 1)[-1] == sid or numbered_sid.endswith('_' + sid):
+                            exp._stage_protocols[numbered_sid] = proto_obj
+                            break
+
     state["experiment"] = exp
     state["stages"] = list(exp.stages)
     state["current_stage_idx"] = -1
     state["stage_metrics"] = []
     state["protocol"] = protocol
+    state["stage_protocols"] = stage_protocols or {}
 
 
 def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = False) -> tuple:
@@ -197,35 +226,153 @@ def _compute_human_time() -> float:
     return total
 
 
+def _task_log_dir(task_name: str) -> Path:
+    """Return the per-task consolidated log directory (e.g. logs/minidb/)."""
+    return Path("logs") / task_name
+
+
 def _consolidate_log(exp):
-    """Copy the experiment log JSON and merge tree nodes into the consolidated logs/ directory."""
+    """Copy the experiment log JSON and merge tree nodes into the per-task logs/ subdirectory."""
     if not exp or not exp.log_dir:
         return
-    consolidated_dir = Path("logs")
-    consolidated_dir.mkdir(exist_ok=True)
+    task_name = Path(exp.task_dir).name if exp.task_dir else None
+    if task_name:
+        consolidated_dir = _task_log_dir(task_name)
+    else:
+        consolidated_dir = Path("logs")
+    consolidated_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy metrics JSON
     log_file = Path(exp.log_dir) / f"{exp.run_id}.json"
     if log_file.exists():
         shutil.copy2(str(log_file), str(consolidated_dir / log_file.name))
 
-    # Merge run's tree nodes into the consolidated tree
+    # Merge run's tree nodes into the consolidated tree, remapping IDs to avoid
+    # collisions (each run starts node IDs at node_001).
     run_tree_file = Path(exp.log_dir) / "experiment_tree.json"
     if run_tree_file.exists():
         consolidated_tree = StateTree(str(consolidated_dir))
         with open(run_tree_file) as f:
             run_data = json.load(f)
-        for nid, ndata in run_data.get("nodes", {}).items():
-            if nid not in consolidated_tree.nodes:
-                consolidated_tree.nodes[nid] = TreeNode.from_dict(ndata)
-        # Update next ID counter
-        if consolidated_tree.nodes:
-            max_num = max(
-                int(nid.split("_")[1]) for nid in consolidated_tree.nodes
-                if nid.startswith("node_") and nid.split("_")[1].isdigit()
-            )
-            consolidated_tree._next_id = max(consolidated_tree._next_id, max_num + 1)
+        run_nodes = run_data.get("nodes", {})
+        # Build a mapping from run node IDs to consolidated node IDs.
+        # Nodes that already exist (same git_tag) are reused; others get new IDs.
+        id_map = {}
+        for nid, ndata in run_nodes.items():
+            # Check if this exact node already exists by git_tag (unique per commit)
+            existing = consolidated_tree.find_by_tag(ndata.get("git_tag", ""))
+            if existing:
+                id_map[nid] = existing.node_id
+            else:
+                new_id = consolidated_tree._make_id()
+                id_map[nid] = new_id
+                node = TreeNode.from_dict(ndata)
+                node.node_id = new_id
+                # Remap parent reference
+                if node.parent and node.parent in id_map:
+                    node.parent = id_map[node.parent]
+                consolidated_tree.nodes[new_id] = node
+        # Second pass: fix parent references for nodes whose parents were mapped
+        # after they were inserted
+        for nid, ndata in run_nodes.items():
+            mapped_id = id_map[nid]
+            if mapped_id in consolidated_tree.nodes:
+                node = consolidated_tree.nodes[mapped_id]
+                if node.parent and node.parent in id_map:
+                    node.parent = id_map[node.parent]
         consolidated_tree.save()
+
+
+def _migrate_legacy_logs():
+    """Migrate root-level log files into per-task subdirectories.
+
+    Idempotent: skips if no root-level JSON log files exist.
+    """
+    logs_dir = Path("logs")
+    if not logs_dir.exists():
+        return
+
+    # Find root-level JSON files (not in subdirs, not tree file)
+    root_jsons = [f for f in logs_dir.glob("*.json") if f.name != "experiment_tree.json"]
+    if not root_jsons:
+        return
+
+    _harness_log(f"migrate: found {len(root_jsons)} legacy log files")
+
+    # Load root tree if it exists
+    root_tree_file = logs_dir / "experiment_tree.json"
+    root_tree_data = {}
+    if root_tree_file.exists():
+        try:
+            with open(root_tree_file) as f:
+                root_tree_data = json.load(f).get("nodes", {})
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Map run_id -> task_name from log files
+    run_to_task = {}
+    for f in root_jsons:
+        try:
+            with open(f) as fh:
+                log = json.load(fh)
+            task_path = log.get("task", "")
+            if not task_path:
+                continue
+            task_name = Path(task_path).name
+            run_id = log.get("run_id", f.stem)
+            run_to_task[run_id] = task_name
+
+            # Move log file to per-task dir
+            dest_dir = _task_log_dir(task_name)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f.name
+            if not dest.exists():
+                shutil.move(str(f), str(dest))
+                _harness_log(f"migrate: {f.name} -> {dest_dir.name}/")
+            else:
+                f.unlink()
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    # Distribute tree nodes into per-task trees based on run_id
+    if root_tree_data:
+        task_nodes = {}  # task_name -> {nid: ndata}
+        for nid, ndata in root_tree_data.items():
+            # Match node's run_id to a task
+            node_run_id = ndata.get("run_id", "")
+            task_name = run_to_task.get(node_run_id)
+            if not task_name:
+                # Try to match by checking if run_id prefix matches any known task
+                for rid, tname in run_to_task.items():
+                    if node_run_id and node_run_id == rid:
+                        task_name = tname
+                        break
+            if task_name:
+                task_nodes.setdefault(task_name, {})[nid] = ndata
+
+        for task_name, nodes in task_nodes.items():
+            task_dir = _task_log_dir(task_name)
+            task_dir.mkdir(parents=True, exist_ok=True)
+            tree = StateTree(str(task_dir))
+            for nid, ndata in nodes.items():
+                if nid not in tree.nodes:
+                    tree.nodes[nid] = TreeNode.from_dict(ndata)
+            if tree.nodes:
+                max_num = max(
+                    int(nid.split("_")[1]) for nid in tree.nodes
+                    if nid.startswith("node_") and nid.split("_")[1].isdigit()
+                )
+                tree._next_id = max(tree._next_id, max_num + 1)
+            tree.save()
+
+        # Remove root tree after successful migration
+        try:
+            root_tree_file.unlink()
+            _harness_log("migrate: removed root experiment_tree.json")
+        except OSError:
+            pass
+
+    _harness_log("migrate: legacy log migration complete")
 
 
 async def _monitor_pty_exit():
@@ -381,10 +528,11 @@ async def _auto_start_next_stage():
     })
     state["stage_start_time"] = time.time()
 
-    # Spawn claude in PTY with headless mode
+    # Spawn claude in PTY with headless mode (use per-stage protocol)
     _kill_pty()
+    stage_protocol = exp.get_protocol_for_stage(stage_id)
     master_fd, child_pid = _spawn_claude_pty(
-        str(exp.work_dir), prompt, state["protocol"], headless=True
+        str(exp.work_dir), prompt, stage_protocol, headless=True
     )
     state["pty_fd"] = master_fd
     state["child_pid"] = child_pid
@@ -428,13 +576,81 @@ async def get_protocols():
 from fastapi import Request as FastAPIRequest
 
 
+@app.post("/api/task/select")
+async def select_task(request: FastAPIRequest):
+    """Select (or switch) the active task directory."""
+    body = await request.json()
+    task_dir = body.get("task_dir")
+    if not task_dir or not Path(task_dir).is_dir():
+        return {"error": f"Invalid task directory: {task_dir}"}
+
+    # If experiment is active, save and consolidate before switching
+    exp = state["experiment"]
+    if exp:
+        try:
+            exp.save_log()
+            _consolidate_log(exp)
+        except Exception:
+            pass
+        _kill_pty()
+
+    # Reset experiment state
+    state["experiment"] = None
+    state["current_stage_idx"] = -1
+    state["stages"] = []
+    state["stage_metrics"] = []
+    state["pty_fd"] = None
+    state["child_pid"] = None
+    state["pty_monitor_task"] = None
+    state["presence_segments"] = []
+    state["presence_status"] = "active"
+    state["stage_start_time"] = None
+    state["paused"] = False
+    state["auto_mode"] = False
+    state["auto_advance"] = False
+    state["auto_status"] = None
+    state["stage_protocols"] = {}
+
+    # Set new task
+    state["task_dir"] = task_dir
+    task_name = Path(task_dir).name
+    state["current_task_name"] = task_name
+
+    # Load task config
+    cfg = load_task_config(task_dir)
+    stages = [s["id"] if isinstance(s, dict) else s for s in cfg.get("stages", [])]
+    pipelines = cfg.get("pipelines", {})
+
+    # Load existing tree for this task
+    tree_dir = _task_log_dir(task_name)
+    tree_data = {}
+    if tree_dir.exists():
+        tree = StateTree(str(tree_dir))
+        tree_data = tree.to_dict().get("nodes", {})
+
+    return {
+        "task_name": cfg.get("name", task_name),
+        "task_dir": task_dir,
+        "stages": stages,
+        "pipelines": pipelines,
+        "tree_nodes": tree_data,
+    }
+
+
 @app.post("/api/experiment/init")
 async def init_experiment_api(request: FastAPIRequest):
-    """Initialize (or re-initialize) experiment with a chosen protocol."""
+    """Initialize (or re-initialize) experiment with per-stage protocol assignments."""
     body = await request.json()
     protocol_name = body.get("protocol")
+    stage_protocols = body.get("stage_protocols", {})
+
     if not protocol_name or protocol_name not in ALL_PROTOCOLS:
         return {"error": f"Invalid protocol: {protocol_name}"}
+
+    # Validate all per-stage protocol names
+    for sid, pname in stage_protocols.items():
+        if pname not in ALL_PROTOCOLS:
+            return {"error": f"Invalid protocol for stage {sid}: {pname}"}
 
     task_dir = state["task_dir"]
     if not task_dir:
@@ -452,13 +668,14 @@ async def init_experiment_api(request: FastAPIRequest):
     # Initialize with stored kwargs
     kwargs = dict(state["launch_kwargs"])
     kwargs["model"] = kwargs.pop("model", None)
-    init_experiment(task_dir, protocol_name, **kwargs)
+    init_experiment(task_dir, protocol_name, stage_protocols=stage_protocols, **kwargs)
 
     exp = state["experiment"]
     return {
         "run_id": exp.run_id,
         "stages": list(exp.stages),
         "protocol": protocol_name,
+        "stage_protocols": stage_protocols,
     }
 
 
@@ -534,6 +751,9 @@ async def get_state():
         "auto_advance": state["auto_advance"],
         "auto_status": state["auto_status"],
         "harness_log": state["harness_log"][-20:],  # last 20 entries for polling
+        "task_dir": state["task_dir"],
+        "current_task_name": state["current_task_name"],
+        "stage_protocols": state.get("stage_protocols", {}),
     }
 
 
@@ -570,11 +790,12 @@ async def start_stage():
     })
     state["stage_start_time"] = time.time()
 
-    # Spawn claude in PTY
+    # Spawn claude in PTY (use per-stage protocol if available)
     _kill_pty()
     headless = state["auto_mode"]
+    stage_protocol = exp.get_protocol_for_stage(stage_id)
     master_fd, child_pid = _spawn_claude_pty(
-        str(exp.work_dir), prompt, state["protocol"], headless=headless
+        str(exp.work_dir), prompt, stage_protocol, headless=headless
     )
     state["pty_fd"] = master_fd
     state["child_pid"] = child_pid
@@ -673,9 +894,13 @@ async def abort_experiment():
 
 
 @app.get("/api/tree")
-async def get_tree():
-    """Return the experiment state tree."""
-    log_dir = Path("logs")
+async def get_tree(task: str = None):
+    """Return the experiment state tree, optionally per-task."""
+    task_name = task or state.get("current_task_name")
+    if task_name:
+        log_dir = _task_log_dir(task_name)
+    else:
+        log_dir = Path("logs")
     if not log_dir.exists():
         return {"nodes": {}}
     tree = StateTree(str(log_dir))
@@ -693,9 +918,13 @@ async def get_pipelines():
 
 
 @app.get("/api/comparisons/available")
-async def get_available_comparisons():
+async def get_available_comparisons(task: str = None):
     """Return computable and missing differential comparisons."""
-    log_dir = Path("logs")
+    task_name = task or state.get("current_task_name")
+    if task_name:
+        log_dir = _task_log_dir(task_name)
+    else:
+        log_dir = Path("logs")
     if not log_dir.exists():
         return {"available": [], "missing": []}
     tree = StateTree(str(log_dir))
@@ -747,7 +976,7 @@ async def fork_experiment(request: FastAPIRequest):
         protocol_name=protocol_name,
         work_dir=dirs["workspace"],
         log_dir=dirs["results"],
-        engine_cmd=kwargs.get("engine_cmd", "python3 minidb.py"),
+        engine_cmd=kwargs.get("engine_cmd", ""),
         pipeline_name=pipeline_name,
         slots=slots,
     )
@@ -984,25 +1213,24 @@ async def get_tasks():
 
 @app.post("/api/differential/analyze")
 async def analyze_differential(request: FastAPIRequest):
-    """Compute A/B differential analysis.
+    """Compute A/B differential analysis — all non-baseline protocols vs baseline.
 
     Body: {
         task: "tasks/minidb",
         group_a: [0, 1],         # stage indices for group A
         group_b: [2],            # stage indices for group B
-        treatment: "plan_and_implement",
         baseline: "direct_tests_provided",
         metrics: ["holdout_accuracy", "effective_tokens"]
     }
 
-    The treatment condition: treatment protocol on all A stages, baseline on all B stages.
-    The baseline condition: baseline protocol on all A and B stages.
+    For each non-baseline protocol found in data, computes:
+      Treatment condition: that protocol on A stages, baseline on B stages.
+      Baseline condition: baseline protocol on all A and B stages.
     """
     body = await request.json()
     task_path = body.get("task", "")
     group_a = body.get("group_a", [])
     group_b = body.get("group_b", [])
-    treatment_proto = body.get("treatment", "")
     baseline_proto = body.get("baseline", "")
     metric_names = body.get("metrics", ["holdout_accuracy"])
 
@@ -1050,14 +1278,52 @@ async def analyze_differential(request: FastAPIRequest):
                 return s
         return None
 
+    # Snapshot metrics record cumulative totals (e.g. total code size), not
+    # per-stage deltas.  For the differential we need the change during B, so
+    # we subtract the value at the end of the last A stage.
+    SNAPSHOT_METRICS = {"code_lines", "code_bytes"}
+
+    def _get_b_value(metric, stage_data, stages_data, a_stages_set):
+        """Return the metric value for a B stage, adjusting snapshots to deltas."""
+        val = stage_data.get(metric)
+        if val is None:
+            return None
+        if metric not in SNAPSHOT_METRICS:
+            return val
+        # Find the last A stage (by position in the run) to use as baseline
+        a_vals = []
+        for s in stages_data:
+            sid = s.get("stage_id", "")
+            if sid in a_stages_set or any(sid.endswith(f"_{a}") for a in a_stages_set):
+                v = s.get(metric)
+                if v is not None:
+                    a_vals.append(v)
+        if a_vals:
+            return val - a_vals[-1]  # delta = B snapshot - last A snapshot
+        return val  # no A stage found, return raw (shouldn't happen)
+
+    # Discover all non-baseline protocols used on A stages across logs
+    all_protocols = set()
+    for log in task_logs:
+        for sid in a_stages:
+            p = get_stage_protocol(log, sid)
+            if p:
+                all_protocols.add(p)
+    all_protocols.discard(baseline_proto)
+    treatment_protocols = sorted(all_protocols)
+
+    if not treatment_protocols:
+        return {"error": f"No non-baseline protocols found in data (baseline={baseline_proto})"}
+
     # Find matching runs.
-    # Treatment condition: treatment on A stages, baseline on B stages.
-    # Baseline condition: baseline on all A+B stages.
-    # For single-protocol runs, we also accept: treatment on all stages
-    # (measures B-stage metrics after treatment was applied to A).
-    treatment_metric_values = {m: [] for m in metric_names}
+    # For each treatment protocol T:
+    #   Treatment condition: T on A stages, baseline on B stages (M(A_t, B_b)).
+    # Baseline condition: baseline on all A+B stages (M(A_b, B_b)).
+    per_treatment_metric_values = {tp: {m: [] for m in metric_names} for tp in treatment_protocols}
+    per_treatment_runs = {tp: [] for tp in treatment_protocols}
+    found_treatments = {tp: False for tp in treatment_protocols}
     baseline_metric_values = {m: [] for m in metric_names}
-    found_treatment = False
+    baseline_runs = []
     found_baseline = False
 
     for log in task_logs:
@@ -1066,35 +1332,40 @@ async def analyze_differential(request: FastAPIRequest):
         for sid in list(a_stages) + list(b_stages):
             proto_map[sid] = get_stage_protocol(log, sid)
 
-        # Ideal match: treatment on A, baseline on B (mixed-protocol run)
-        a_treatment = all(proto_map.get(s) == treatment_proto for s in a_stages)
-        b_baseline = all(proto_map.get(s) == baseline_proto for s in b_stages)
-
-        # Also accept: treatment on all stages (single-protocol run with treatment)
-        all_treatment = all(proto_map.get(s) == treatment_proto for s in a_stages | b_stages)
-
         # Baseline: baseline on all stages
         all_baseline = all(proto_map.get(s) == baseline_proto for s in a_stages | b_stages)
-
-        if (a_treatment and b_baseline) or all_treatment:
-            found_treatment = True
-            for sid in b_stages:
-                stage_data = match_stage_id(sid, stages_data)
-                if stage_data:
-                    for m in metric_names:
-                        val = stage_data.get(m)
-                        if val is not None:
-                            treatment_metric_values[m].append(val)
-
         if all_baseline:
             found_baseline = True
+            baseline_runs.append({
+                "run_id": log.get("run_id", "unknown"),
+                "protocol_map": dict(proto_map),
+            })
             for sid in b_stages:
                 stage_data = match_stage_id(sid, stages_data)
                 if stage_data:
                     for m in metric_names:
-                        val = stage_data.get(m)
+                        val = _get_b_value(m, stage_data, stages_data, a_stages)
                         if val is not None:
                             baseline_metric_values[m].append(val)
+
+        # Check each treatment protocol
+        b_baseline = all(proto_map.get(s) == baseline_proto for s in b_stages)
+        if b_baseline:
+            for tp in treatment_protocols:
+                a_treatment = all(proto_map.get(s) == tp for s in a_stages)
+                if a_treatment:
+                    found_treatments[tp] = True
+                    per_treatment_runs[tp].append({
+                        "run_id": log.get("run_id", "unknown"),
+                        "protocol_map": dict(proto_map),
+                    })
+                    for sid in b_stages:
+                        stage_data = match_stage_id(sid, stages_data)
+                        if stage_data:
+                            for m in metric_names:
+                                val = _get_b_value(m, stage_data, stages_data, a_stages)
+                                if val is not None:
+                                    per_treatment_metric_values[tp][m].append(val)
 
     # Compute stats
     def compute_stats(values):
@@ -1110,40 +1381,60 @@ async def analyze_differential(request: FastAPIRequest):
 
     results = {}
     for m in metric_names:
-        results[m] = {
-            "treatment": compute_stats(treatment_metric_values[m]),
-            "baseline": compute_stats(baseline_metric_values[m]),
-        }
-        t = results[m]["treatment"]
-        b = results[m]["baseline"]
-        if t["mean"] is not None and b["mean"] is not None:
-            results[m]["delta"] = t["mean"] - b["mean"]
-        else:
-            results[m]["delta"] = None
+        baseline_stats = compute_stats(baseline_metric_values[m])
+        treatments = {}
+        for tp in treatment_protocols:
+            t_stats = compute_stats(per_treatment_metric_values[tp][m])
+            delta = None
+            if t_stats["mean"] is not None and baseline_stats["mean"] is not None:
+                delta = t_stats["mean"] - baseline_stats["mean"]
+            treatments[tp] = {"stats": t_stats, "delta": delta}
+        results[m] = {"baseline": baseline_stats, "treatments": treatments}
 
     # Determine missing runs
     missing = []
     a_list = sorted(a_stages)
     b_list = sorted(b_stages)
-    if not found_treatment:
-        missing.append({
-            "condition": "treatment",
-            "description": f"Need a run with {treatment_proto} on stages [{', '.join(a_list)}] and {baseline_proto} on stages [{', '.join(b_list)}]",
-            "protocol_map": {s: treatment_proto for s in a_list} | {s: baseline_proto for s in b_list},
-        })
+    for tp in treatment_protocols:
+        if not found_treatments[tp]:
+            missing.append({
+                "condition": "treatment",
+                "protocol": tp,
+                "description": (
+                    f"Need a run with {tp} on A stages [{', '.join(a_list)}] "
+                    f"and {baseline_proto} on B stages [{', '.join(b_list)}]."
+                ),
+                "protocol_map": {s: tp for s in a_list} | {s: baseline_proto for s in b_list},
+                "fork_hint": {
+                    "explanation": f"Run pipeline with A={tp}, B={baseline_proto}",
+                    "a_stages": a_list,
+                    "b_stages": b_list,
+                    "a_protocol": tp,
+                    "b_protocol": baseline_proto,
+                },
+            })
     if not found_baseline:
         missing.append({
             "condition": "baseline",
             "description": f"Need a run with {baseline_proto} on all stages [{', '.join(sorted(a_stages | b_stages))}]",
             "protocol_map": {s: baseline_proto for s in sorted(a_stages | b_stages)},
+            "fork_hint": {
+                "explanation": f"Run pipeline with {baseline_proto} on all stages",
+                "a_stages": a_list,
+                "b_stages": b_list,
+                "a_protocol": baseline_proto,
+                "b_protocol": baseline_proto,
+            },
         })
 
     return {
         "results": results,
         "missing": missing,
+        "treatment_runs": per_treatment_runs,
+        "baseline_runs": baseline_runs,
         "group_a": a_list,
         "group_b": b_list,
-        "treatment_protocol": treatment_proto,
+        "treatment_protocols": treatment_protocols,
         "baseline_protocol": baseline_proto,
     }
 
@@ -1201,6 +1492,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .btn-init { width: 100%; margin-bottom: 12px; }
   .info-panel { background: #1a1a2e; border-radius: 6px; padding: 10px; margin-bottom: 10px; font-size: 12px; line-height: 1.5; color: #ccc; white-space: pre-wrap; word-wrap: break-word; max-height: 250px; overflow-y: auto; }
   .info-panel.empty { color: #555; font-style: italic; }
+  #tree-overlay svg text { user-select: none; }
+  #tree-overlay svg g:hover rect { filter: brightness(1.3); }
   .stat-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; border-bottom: 1px solid #0f3460; }
   .stat-label { color: #888; }
   .stat-value { color: #e0e0e0; font-weight: 500; font-variant-numeric: tabular-nums; }
@@ -1240,6 +1533,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .diff-preset-bar { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
   .diff-preset-btn { padding: 3px 8px; font-size: 11px; border-radius: 4px; border: 1px solid #0f3460; background: #1a1a2e; color: #888; cursor: pointer; }
   .diff-preset-btn:hover { background: #0f3460; color: #e0e0e0; }
+  .pareto-axis-config { border: 1px solid #0f3460; border-radius: 6px; padding: 10px; margin-bottom: 10px; }
+  .pareto-axis-title { font-size: 12px; font-weight: 600; color: #e94560; margin-bottom: 6px; }
+  .stage-proto-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .stage-proto-row .stage-label { font-size: 12px; color: #ccc; min-width: 90px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stage-proto-row select { flex: 1; padding: 3px 4px; font-size: 11px; border-radius: 4px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; }
 </style>
 </head>
 <body>
@@ -1251,18 +1549,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <button class="tab-btn active" onclick="switchTab('experiment')">Experiment</button>
   <button class="tab-btn" onclick="switchTab('visualizer')">Results Visualizer</button>
   <button class="tab-btn" onclick="switchTab('differential')">Differential Analysis</button>
+  <button class="tab-btn" onclick="switchTab('pareto')">Pareto Analysis</button>
 </div>
 <!-- Tab: Experiment (default) -->
 <div id="tab-experiment" class="tab-content active" style="flex-direction:column;flex:1;">
 <div class="main" style="flex:1;">
   <div class="sidebar-left">
-    <div class="section-title">Protocol</div>
-    <select id="protocol-select" onchange="updateProtocolInfo()">
-      <option value="">Loading...</option>
+    <div class="section-title">Task</div>
+    <select id="task-select" onchange="selectTask()">
+      <option value="">Select a task...</option>
     </select>
+    <div class="proto-desc" id="task-desc"></div>
+    <div class="section-title">Set All Protocols</div>
+    <div style="display:flex;gap:4px;margin-bottom:8px;">
+      <select id="protocol-select-all" style="flex:1;" onchange="setAllProtocols()">
+        <option value="">Loading...</option>
+      </select>
+    </div>
     <div class="proto-desc" id="proto-desc"></div>
+    <div class="section-title">Stages &amp; Protocols</div>
+    <div id="stage-protocol-list" style="margin-bottom:8px;"></div>
     <button class="btn-primary btn-init" id="btn-init" onclick="initExperiment()">Initialize Experiment</button>
-    <div class="section-title">Stages</div>
+    <div class="section-title">Run Progress</div>
     <div id="stage-list"></div>
   </div>
   <div class="terminal-area">
@@ -1333,6 +1641,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <option value="input_tokens">Input Tokens</option>
         <option value="cache_creation_tokens">Cache Write Tokens</option>
         <option value="cache_read_tokens">Cache Read Tokens</option>
+        <option value="perf_mean_duration">Perf Mean Duration (s)</option>
       </select>
 
       <div class="viz-label">Group Bars By</div>
@@ -1355,6 +1664,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="viz-checkbox-row">
         <input type="checkbox" id="viz-coalesce">
         <label for="viz-coalesce">Coalesce by stage tags</label>
+      </div>
+      <div class="viz-checkbox-row">
+        <input type="checkbox" id="viz-normalize">
+        <label for="viz-normalize">Normalize within stages</label>
+      </div>
+      <div style="font-size:10px;color:#666;margin-left:20px;">
+        Cumulative only: divide by cross-protocol stage mean before averaging. Accuracies become error rates.
       </div>
 
       <button class="viz-btn" onclick="renderVizChart()">Update Chart</button>
@@ -1380,9 +1696,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <option value="">Select a task...</option>
       </select>
 
-      <div class="viz-label">Treatment Protocol</div>
-      <select class="viz-select" id="diff-treatment"></select>
-
       <div class="viz-label">Baseline Protocol</div>
       <select class="viz-select" id="diff-baseline"></select>
 
@@ -1394,6 +1707,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="viz-checkbox-row"><input type="checkbox" value="effective_tokens"><label>Effective Tokens</label></div>
         <div class="viz-checkbox-row"><input type="checkbox" value="wall_time_seconds"><label>Wall Time</label></div>
         <div class="viz-checkbox-row"><input type="checkbox" value="code_lines"><label>Code Lines</label></div>
+        <div class="viz-checkbox-row"><input type="checkbox" value="perf_mean_duration"><label>Perf Mean Duration (s)</label></div>
       </div>
 
       <div class="viz-label" style="margin-top:14px;">Stage Groups</div>
@@ -1406,10 +1720,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="diff-result-card">
         <div style="color:#888;font-size:13px;">Select a task, configure groups A and B, then click Analyze.</div>
         <div style="color:#666;font-size:12px;margin-top:8px;">
-          Group A = stages where the treatment protocol is applied.<br>
+          Group A = stages where treatment protocols are applied.<br>
           Group B = stages where the baseline protocol is applied (measurement point).<br><br>
-          The differential compares:<br>
-          Treatment: treatment on A, baseline on B<br>
+          All non-baseline protocols found in data are compared against the baseline.<br>
+          Treatment: non-baseline protocol on A, baseline on B<br>
           vs. Baseline: baseline on all of A+B<br><br>
           The effect is measured on the B stages.
         </div>
@@ -1418,11 +1732,102 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Tab: Pareto Analysis -->
+<div id="tab-pareto" class="tab-content">
+  <div class="viz-container">
+    <div class="viz-sidebar" style="width:360px;">
+      <div class="viz-label">Task Filter</div>
+      <select class="viz-select" id="pareto-task" onchange="paretoTaskChanged()">
+        <option value="">All Tasks</option>
+      </select>
+
+      <div class="viz-label">Stage / Tag Filter</div>
+      <select class="viz-select" id="pareto-stage-filter">
+        <option value="">All stages</option>
+      </select>
+
+      <div class="pareto-axis-config">
+        <div class="pareto-axis-title">X Axis</div>
+        <select class="viz-select" id="pareto-x-metric">
+          <option value="effective_tokens">Effective Tokens</option>
+          <option value="holdout_accuracy">Holdout Accuracy</option>
+          <option value="training_accuracy">Training Accuracy</option>
+          <option value="regression_rate">Regression Rate</option>
+          <option value="wall_time_seconds">Wall Time (s)</option>
+          <option value="human_time_seconds">Human Time (s)</option>
+          <option value="output_tokens">Output Tokens</option>
+          <option value="total_tokens">Total Tokens</option>
+          <option value="code_lines">Code Lines</option>
+          <option value="perf_mean_duration">Perf Mean Duration (s)</option>
+        </select>
+        <div class="viz-label">Mode</div>
+        <select class="viz-select" id="pareto-x-mode" onchange="paretoModeChanged()">
+          <option value="raw">Raw (per-protocol mean)</option>
+          <option value="differential">Sequential Differential (Δ)</option>
+        </select>
+        <div class="viz-label">Direction</div>
+        <select class="viz-select" id="pareto-x-dir">
+          <option value="lower">Lower is better</option>
+          <option value="higher">Higher is better</option>
+        </select>
+      </div>
+
+      <div class="pareto-axis-config">
+        <div class="pareto-axis-title">Y Axis</div>
+        <select class="viz-select" id="pareto-y-metric">
+          <option value="holdout_accuracy" selected>Holdout Accuracy</option>
+          <option value="training_accuracy">Training Accuracy</option>
+          <option value="regression_rate">Regression Rate</option>
+          <option value="effective_tokens">Effective Tokens</option>
+          <option value="wall_time_seconds">Wall Time (s)</option>
+          <option value="human_time_seconds">Human Time (s)</option>
+          <option value="output_tokens">Output Tokens</option>
+          <option value="total_tokens">Total Tokens</option>
+          <option value="code_lines">Code Lines</option>
+          <option value="perf_mean_duration">Perf Mean Duration (s)</option>
+        </select>
+        <div class="viz-label">Mode</div>
+        <select class="viz-select" id="pareto-y-mode" onchange="paretoModeChanged()">
+          <option value="raw">Raw (per-protocol mean)</option>
+          <option value="differential">Sequential Differential (Δ)</option>
+        </select>
+        <div class="viz-label">Direction</div>
+        <select class="viz-select" id="pareto-y-dir">
+          <option value="higher">Higher is better</option>
+          <option value="lower">Lower is better</option>
+        </select>
+      </div>
+
+      <div id="pareto-diff-config" style="display:none;">
+        <div class="viz-label">Baseline Protocol</div>
+        <select class="viz-select" id="pareto-baseline"></select>
+        <div class="viz-label">Treatment Stages (A)</div>
+        <div class="diff-preset-bar" id="pareto-presets"></div>
+        <div id="pareto-stage-selector"></div>
+        <div style="font-size:11px;color:#666;margin-top:4px;">
+          A = treatment stages, B = measurement stages.<br>
+          Δ = M(T on A, baseline on B) − M(baseline on all)
+        </div>
+      </div>
+
+      <button class="viz-btn" onclick="renderParetoChart()">Update Chart</button>
+      <div class="viz-info" id="pareto-info">Configure axes and click Update Chart.</div>
+    </div>
+    <div class="viz-main">
+      <div class="viz-chart-wrap">
+        <canvas id="pareto-chart"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Fork dialog -->
-<div id="fork-dialog" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:#16213e; border:1px solid #0f3460; border-radius:10px; padding:20px; z-index:1000; min-width:380px;">
+<div id="fork-dialog" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:#16213e; border:1px solid #0f3460; border-radius:10px; padding:20px; z-index:1001; min-width:380px;">
   <h3 style="margin-bottom:12px; color:#e94560;">Fork from Existing State</h3>
+  <div id="fork-node-info" style="display:none;margin-bottom:10px;padding:8px;background:#1a1a2e;border-radius:6px;font-size:12px;color:#aaa;"></div>
   <label style="font-size:13px;color:#888;">Node ID:</label>
   <input id="fork-node-id" style="width:100%;padding:6px;border-radius:6px;border:1px solid #0f3460;background:#1a1a2e;color:#e0e0e0;margin-bottom:8px;" placeholder="e.g. node_001">
+  <div style="font-size:11px;color:#666;margin-bottom:8px;">Fork starts AFTER this node's completion.</div>
   <label style="font-size:13px;color:#888;">Protocol:</label>
   <select id="fork-protocol" style="width:100%;padding:6px;border-radius:6px;border:1px solid #0f3460;background:#1a1a2e;color:#e0e0e0;margin-bottom:8px;"></select>
   <label style="font-size:13px;color:#888;">Pipeline (optional):</label>
@@ -1431,9 +1836,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </select>
   <div style="display:flex;gap:8px;">
     <button class="btn-primary" onclick="executeFork()">Fork</button>
-    <button class="btn-secondary" onclick="document.getElementById('fork-dialog').style.display='none'">Cancel</button>
+    <button class="btn-secondary" onclick="document.getElementById('fork-dialog').style.display='none';selectedForkNode=null;">Cancel</button>
   </div>
 </div>
+<div id="fork-dialog-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;" onclick="document.getElementById('fork-dialog').style.display='none';this.style.display='none';selectedForkNode=null;"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10/lib/addon-fit.min.js"></script>
@@ -1448,12 +1854,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   let lastPtyActive = false;
   let lastStageIdx = -1;
   let protocolsData = [];
+  let currentTaskName = null;
+  let tasksData = {};
+  let currentTaskStages = [];  // stage IDs for the selected task
 
   // Visualization state
   let vizChart = null;
   let vizLogsData = null;
   let vizTasksData = null;
-  let diffChart = null;
+  let diffChart = []; // array of per-metric charts
+  let paretoChart = null;
 
   function switchTab(tabId) {
     document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -1462,7 +1872,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     if (tab) tab.classList.add('active');
     // Activate the button
     const buttons = document.querySelectorAll('.tab-btn');
-    const tabNames = ['experiment', 'visualizer', 'differential'];
+    const tabNames = ['experiment', 'visualizer', 'differential', 'pareto'];
     const idx = tabNames.indexOf(tabId);
     if (idx >= 0 && buttons[idx]) buttons[idx].classList.add('active');
     // Resize terminal when switching back to experiment tab
@@ -1470,7 +1880,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       setTimeout(() => fitAddon.fit(), 50);
     }
     // Load viz data when switching to visualizer or differential
-    if (tabId === 'visualizer' || tabId === 'differential') {
+    if (tabId === 'visualizer' || tabId === 'differential' || tabId === 'pareto') {
       loadVizData();
     }
   }
@@ -1498,12 +1908,102 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     window.addEventListener('resize', () => fitAddon.fit());
   }
 
+  async function loadTasks() {
+    try {
+      const res = await fetch('/api/tasks');
+      const data = await res.json();
+      tasksData = data.tasks || {};
+      const select = document.getElementById('task-select');
+      select.innerHTML = '<option value="">Select a task...</option>';
+      Object.entries(tasksData).forEach(([path, cfg]) => {
+        const opt = document.createElement('option');
+        opt.value = path;
+        opt.textContent = cfg.name || path.split('/').pop();
+        select.appendChild(opt);
+      });
+      // Pre-select if task was set via CLI
+      const stateRes = await fetch('/api/state');
+      const stateData = await stateRes.json();
+      if (stateData.task_dir) {
+        select.value = stateData.task_dir;
+        currentTaskName = stateData.current_task_name || null;
+        document.getElementById('task-desc').textContent =
+          tasksData[stateData.task_dir]?.name || '';
+        // Load stage list for pre-selected task
+        const cfg = tasksData[stateData.task_dir];
+        if (cfg && cfg.stages) {
+          currentTaskStages = cfg.stages.map(s => typeof s === 'object' ? s.id : s);
+        }
+        buildStageProtocolList();
+      }
+      updateInitButton();
+    } catch(e) {
+      console.error('Failed to load tasks:', e);
+    }
+  }
+
+  async function selectTask() {
+    const taskDir = document.getElementById('task-select').value;
+    if (!taskDir) {
+      currentTaskName = null;
+      currentTaskStages = [];
+      document.getElementById('task-desc').textContent = '';
+      document.getElementById('stage-list').innerHTML = '';
+      document.getElementById('stage-protocol-list').innerHTML = '';
+      updateInitButton();
+      return;
+    }
+    try {
+      const res = await fetch('/api/task/select', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({task_dir: taskDir}),
+      });
+      const data = await res.json();
+      if (data.error) {
+        term.writeln('Error selecting task: ' + data.error);
+        return;
+      }
+      currentTaskName = data.task_name;
+      currentTaskStages = data.stages || [];
+      document.getElementById('task-desc').textContent = data.task_name;
+      term.clear();
+      term.writeln(`Switched to task: ${data.task_name}`);
+      term.writeln(`Stages: ${data.stages.join(', ')}`);
+      term.writeln('Assign protocols to stages and click "Initialize Experiment" to begin.\\r\\n');
+      buildStageProtocolList();
+      refreshState();
+      loadTree();
+      loadComparisons();
+      updateInitButton();
+    } catch(e) {
+      term.writeln('Error: ' + e.message);
+    }
+  }
+
+  function updateInitButton() {
+    const taskSelected = !!document.getElementById('task-select').value;
+    // Check that all stages have a protocol assigned
+    const allAssigned = currentTaskStages.length > 0 && currentTaskStages.every(sid => {
+      const sel = document.getElementById('stage-proto-' + sid);
+      return sel && sel.value;
+    });
+    document.getElementById('btn-init').disabled = !(taskSelected && allAssigned);
+    // Warn if experiment already initialized (e.g. after fork)
+    const btn = document.getElementById('btn-init');
+    if (btn._experimentActive) {
+      btn.textContent = 'Re-Initialize (resets fork)';
+    } else {
+      btn.textContent = 'Initialize Experiment';
+    }
+  }
+
   async function loadProtocols() {
     const res = await fetch('/api/protocols');
     const data = await res.json();
     protocolsData = data.protocols;
-    const select = document.getElementById('protocol-select');
-    select.innerHTML = '';
+    const select = document.getElementById('protocol-select-all');
+    select.innerHTML = '<option value="">(select to set all)</option>';
     protocolsData.forEach(p => {
       const opt = document.createElement('option');
       opt.value = p.name;
@@ -1513,12 +2013,58 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // Pre-select default if provided
     if (data.default && protocolsData.some(p => p.name === data.default)) {
       select.value = data.default;
+      setAllProtocols();
     }
     updateProtocolInfo();
+    updateInitButton();
+  }
+
+  function buildStageProtocolList() {
+    const container = document.getElementById('stage-protocol-list');
+    container.innerHTML = '';
+    if (currentTaskStages.length === 0) {
+      container.innerHTML = '<div style="color:#555;font-size:12px;font-style:italic;">Select a task to see stages</div>';
+      return;
+    }
+    const defaultProto = document.getElementById('protocol-select-all').value;
+    currentTaskStages.forEach(sid => {
+      const row = document.createElement('div');
+      row.className = 'stage-proto-row';
+      const label = document.createElement('span');
+      label.className = 'stage-label';
+      label.textContent = sid.replace(/_/g, ' ');
+      label.title = sid;
+      row.appendChild(label);
+      const sel = document.createElement('select');
+      sel.id = 'stage-proto-' + sid;
+      sel.onchange = () => { updateInitButton(); };
+      protocolsData.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.name;
+        opt.textContent = p.name;
+        sel.appendChild(opt);
+      });
+      if (defaultProto) sel.value = defaultProto;
+      row.appendChild(sel);
+      container.appendChild(row);
+    });
+    updateInitButton();
+  }
+
+  function setAllProtocols() {
+    const proto = document.getElementById('protocol-select-all').value;
+    if (!proto) return;
+    currentTaskStages.forEach(sid => {
+      const sel = document.getElementById('stage-proto-' + sid);
+      if (sel) sel.value = proto;
+    });
+    updateProtocolInfo();
+    updateInitButton();
   }
 
   function updateProtocolInfo() {
-    const name = document.getElementById('protocol-select').value;
+    // Show info for the "set all" protocol if selected, else show nothing
+    const name = document.getElementById('protocol-select-all').value;
     const proto = protocolsData.find(p => p.name === name);
     document.getElementById('proto-desc').textContent = proto ? proto.description : '';
 
@@ -1538,16 +2084,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
 
   async function initExperiment() {
-    const protocol = document.getElementById('protocol-select').value;
-    if (!protocol) return;
-    document.getElementById('btn-init').disabled = true;
-    document.getElementById('btn-init').textContent = 'Initializing...';
+    const taskDir = document.getElementById('task-select').value;
+    if (!taskDir) { term.writeln('Please select a task first.'); return; }
+
+    // Collect per-stage protocol assignments
+    const stageProtocols = {};
+    let firstProtocol = null;
+    for (const sid of currentTaskStages) {
+      const sel = document.getElementById('stage-proto-' + sid);
+      if (!sel || !sel.value) { term.writeln(`Please assign a protocol to stage: ${sid}`); return; }
+      stageProtocols[sid] = sel.value;
+      if (!firstProtocol) firstProtocol = sel.value;
+    }
+    if (!firstProtocol) { term.writeln('No stages to initialize.'); return; }
+
+    // Warn if an experiment (possibly forked) is already active
+    const btn = document.getElementById('btn-init');
+    if (btn._experimentActive) {
+      if (!confirm('An experiment is already initialized (possibly from a fork). Re-initializing will start fresh from stage 1. Continue?')) return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Initializing...';
     term.clear();
-    term.writeln(`Initializing experiment with protocol: ${protocol}...\\r\\n`);
+
+    // Summarize protocol assignments
+    const uniqueProtos = [...new Set(Object.values(stageProtocols))];
+    if (uniqueProtos.length === 1) {
+      term.writeln(`Initializing experiment with protocol: ${uniqueProtos[0]}...\\r\\n`);
+    } else {
+      term.writeln('Initializing experiment with per-stage protocols:');
+      for (const [sid, proto] of Object.entries(stageProtocols)) {
+        term.writeln(`  ${sid}: ${proto}`);
+      }
+      term.writeln('');
+    }
+
     const res = await fetch('/api/experiment/init', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({protocol}),
+      body: JSON.stringify({protocol: firstProtocol, stage_protocols: stageProtocols}),
     });
     const data = await res.json();
     document.getElementById('btn-init').disabled = false;
@@ -1607,22 +2182,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       // Header info
       if (data.initialized) {
+        const stageProtos = data.stage_protocols || {};
+        const uniqueProtos = [...new Set(Object.values(stageProtos))];
+        let protoLabel = data.protocol || '?';
+        if (uniqueProtos.length > 1) {
+          protoLabel = uniqueProtos.length + ' protocols (mixed)';
+        } else if (uniqueProtos.length === 1) {
+          protoLabel = uniqueProtos[0];
+        }
         document.getElementById('header-info').textContent =
-          `Protocol: ${data.protocol || '?'} | Model: ${data.model || '?'}`;
+          `Protocol: ${protoLabel} | Model: ${data.model || '?'}`;
       }
 
-      // Stage list
+      // Stage list (run progress)
       const list = document.getElementById('stage-list');
       list.innerHTML = '';
+      const stageProtos = data.stage_protocols || {};
       data.stages.forEach((s) => {
         const div = document.createElement('div');
         div.className = 'stage-item ' + s.status;
         let label = s.id.replace(/_/g, ' ');
-        div.innerHTML = `<div>${label}</div>`;
+        // Show protocol assignment for this stage
+        const stageProto = stageProtos[s.id] || stageProtos[s.id.split('_').slice(1).join('_')] || data.protocol;
+        const protoBadge = stageProto ? `<span style="font-size:10px;color:#888;margin-left:4px;">[${stageProto}]</span>` : '';
+        div.innerHTML = `<div>${label}${protoBadge}</div>`;
         if (s.metrics && !s.metrics.skipped) {
+          let perfBit = (s.metrics.perf_tests_total > 0)
+            ? ` | Perf: ${s.metrics.perf_tests_passed}/${s.metrics.perf_tests_total}`
+            : '';
           div.innerHTML += `<div class="metrics-mini">
             Train: ${s.metrics.training_tests_passed}/${s.metrics.training_tests_total}
-            | Holdout: ${s.metrics.holdout_tests_passed}/${s.metrics.holdout_tests_total}
+            | Holdout: ${s.metrics.holdout_tests_passed}/${s.metrics.holdout_tests_total}${perfBit}
             | Tokens: ${(s.metrics.total_tokens||0).toLocaleString()}
           </div>`;
         } else if (s.metrics && s.metrics.skipped) {
@@ -1636,6 +2226,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const hasActive = data.current_stage_idx >= 0;
       const allDone = data.stages.length > 0 && data.stages.every(s => s.status === 'completed' || s.metrics?.skipped);
       document.getElementById('btn-start').disabled = !data.initialized || hasActive || allDone;
+      document.getElementById('btn-init')._experimentActive = data.initialized;
+      updateInitButton();
       document.getElementById('btn-complete').disabled = !hasActive;
       document.getElementById('btn-skip').disabled = !data.initialized || allDone;
 
@@ -1727,6 +2319,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     term.writeln(`\\r\\n--- Stage ${data.stage_id} Complete ---`);
     term.writeln(`Training: ${m.training_tests_passed}/${m.training_tests_total}`);
     term.writeln(`Holdout: ${m.holdout_tests_passed}/${m.holdout_tests_total}`);
+    if (m.perf_tests_total > 0) {
+      term.writeln(`Perf: ${m.perf_tests_passed}/${m.perf_tests_total} benchmarks (avg ${(m.perf_mean_duration||0).toFixed(4)}s)`);
+    }
     term.writeln(`Tokens: ${(m.total_tokens||0).toLocaleString()}`);
     term.writeln(`Code: ${m.code_lines} lines\\r\\n`);
     refreshState();
@@ -1766,32 +2361,167 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     refreshState();
   }
 
+  let treeNodesData = {};
+  let selectedForkNode = null;
+
   async function loadTree() {
     try {
-      const res = await fetch('/api/tree');
+      const taskParam = currentTaskName ? `?task=${encodeURIComponent(currentTaskName)}` : '';
+      const res = await fetch('/api/tree' + taskParam);
       const data = await res.json();
       const panel = document.getElementById('panel-tree');
       const nodes = data.nodes || {};
+      treeNodesData = nodes;
       const ids = Object.keys(nodes).sort();
       if (ids.length === 0) {
         panel.textContent = 'No experiment history yet.';
         panel.className = 'info-panel empty';
         return;
       }
-      let html = '';
-      ids.forEach(id => {
-        const n = nodes[id];
-        const parent = n.parent ? ` ← ${n.parent}` : ' (root)';
-        html += `<div style="margin-bottom:3px;"><span style="color:#e94560;">${id}</span> ${n.stage_id} <span style="color:#888;">[${n.protocol}]</span>${parent}</div>`;
+      // Collect unique protocols for legend
+      const protos = [...new Set(ids.map(id => nodes[id].protocol))].sort();
+      protos.forEach(p => getProtocolColor(p)); // assign colors
+
+      let html = `<div style="margin-bottom:6px;font-size:11px;color:#888;">${ids.length} node${ids.length !== 1 ? 's' : ''}</div>`;
+      // Protocol legend
+      html += '<div style="margin-bottom:8px;">';
+      protos.forEach(p => {
+        html += `<span style="display:inline-block;margin-right:8px;"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${getProtocolColor(p)};margin-right:3px;"></span><span style="font-size:10px;color:#aaa;">${p}</span></span>`;
       });
+      html += '</div>';
+      html += `<button class="btn-secondary" style="width:100%;font-size:11px;padding:4px 8px;" onclick="showTreeOverlay()">Expand Tree</button>`;
       panel.innerHTML = html;
       panel.className = 'info-panel';
     } catch(e) {}
   }
 
+  function showTreeOverlay() {
+    // Remove existing overlay
+    let overlay = document.getElementById('tree-overlay');
+    if (overlay) overlay.remove();
+
+    const nodes = treeNodesData;
+    const ids = Object.keys(nodes).sort();
+    if (ids.length === 0) return;
+
+    // Build adjacency: children map + roots
+    const children = {};
+    const roots = [];
+    ids.forEach(id => { children[id] = []; });
+    ids.forEach(id => {
+      const parent = nodes[id].parent;
+      if (parent && children[parent]) {
+        children[parent].push(id);
+      } else {
+        roots.push(id);
+      }
+    });
+
+    // Layout: assign (col, row) positions via DFS
+    const NODE_W = 110, NODE_H = 36, GAP_X = 20, GAP_Y = 12;
+    const positions = {};
+    let nextRow = 0;
+
+    function layoutNode(id, col) {
+      const kids = children[id] || [];
+      if (kids.length === 0) {
+        positions[id] = { col, row: nextRow };
+        nextRow++;
+      } else {
+        kids.forEach((kid, ki) => {
+          layoutNode(kid, col + 1);
+        });
+        // Parent row = average of children rows
+        const childRows = kids.map(k => positions[k].row);
+        const avgRow = childRows.reduce((a, b) => a + b, 0) / childRows.length;
+        positions[id] = { col, row: avgRow };
+      }
+    }
+    roots.forEach(r => layoutNode(r, 0));
+
+    // Compute SVG dimensions
+    const maxCol = Math.max(...Object.values(positions).map(p => p.col));
+    const maxRow = Math.max(...Object.values(positions).map(p => p.row));
+    const svgW = (maxCol + 1) * (NODE_W + GAP_X) + GAP_X;
+    const svgH = (maxRow + 1) * (NODE_H + GAP_Y) + GAP_Y;
+
+    function nodeX(col) { return GAP_X + col * (NODE_W + GAP_X); }
+    function nodeY(row) { return GAP_Y + row * (NODE_H + GAP_Y); }
+
+    // Build SVG
+    let svg = `<svg width="${svgW}" height="${svgH}" xmlns="http://www.w3.org/2000/svg" style="font-family:system-ui,sans-serif;">`;
+
+    // Edges (bezier curves)
+    ids.forEach(id => {
+      (children[id] || []).forEach(kid => {
+        const p = positions[id];
+        const c = positions[kid];
+        const x1 = nodeX(p.col) + NODE_W;
+        const y1 = nodeY(p.row) + NODE_H / 2;
+        const x2 = nodeX(c.col);
+        const y2 = nodeY(c.row) + NODE_H / 2;
+        const cx = (x1 + x2) / 2;
+        svg += `<path d="M${x1},${y1} C${cx},${y1} ${cx},${y2} ${x2},${y2}" fill="none" stroke="#0f3460" stroke-width="2"/>`;
+      });
+    });
+
+    // Nodes
+    ids.forEach(id => {
+      const n = nodes[id];
+      const p = positions[id];
+      const x = nodeX(p.col);
+      const y = nodeY(p.row);
+      const color = getProtocolColor(n.protocol);
+      const isSelected = selectedForkNode === id;
+      const strokeW = isSelected ? 3 : 1.5;
+      const fillOpacity = isSelected ? 0.3 : 0.1;
+      const truncStage = n.stage_id.length > 12 ? n.stage_id.slice(0, 11) + '…' : n.stage_id;
+      const protoAbbr = n.protocol.length > 10 ? n.protocol.slice(0, 9) + '…' : n.protocol;
+
+      svg += `<g style="cursor:pointer;" onclick="selectTreeNode('${id}')">`;
+      svg += `<rect x="${x}" y="${y}" width="${NODE_W}" height="${NODE_H}" rx="6" ry="6" fill="${color}" fill-opacity="${fillOpacity}" stroke="${color}" stroke-width="${strokeW}"/>`;
+      svg += `<text x="${x + NODE_W/2}" y="${y + 14}" text-anchor="middle" fill="#e0e0e0" font-size="10" style="user-select:none;">${truncStage}</text>`;
+      svg += `<text x="${x + NODE_W/2}" y="${y + 27}" text-anchor="middle" fill="${color}" font-size="9" style="user-select:none;">${protoAbbr}</text>`;
+      svg += '</g>';
+    });
+    svg += '</svg>';
+
+    // Create overlay
+    overlay = document.createElement('div');
+    overlay.id = 'tree-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;flex-direction:column;align-items:center;';
+    overlay.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;width:100%;padding:16px 24px;">
+        <span style="color:#e0e0e0;font-size:14px;font-weight:600;">Experiment Tree</span>
+        <button onclick="document.getElementById('tree-overlay').remove()" style="background:none;border:1px solid #555;color:#e0e0e0;padding:4px 12px;border-radius:6px;cursor:pointer;">Close</button>
+      </div>
+      <div style="flex:1;overflow:auto;padding:0 24px 24px;">${svg}</div>
+    `;
+    document.body.appendChild(overlay);
+  }
+
+  function selectTreeNode(nodeId) {
+    selectedForkNode = nodeId;
+    // Re-render tree overlay with selection highlight
+    showTreeOverlay();
+    // Pre-fill fork dialog
+    const nodeInput = document.getElementById('fork-node-id');
+    if (nodeInput) nodeInput.value = nodeId;
+    // Close overlay and open fork dialog
+    const overlay = document.getElementById('tree-overlay');
+    if (overlay) overlay.remove();
+    showForkDialog();
+    // Set the node ID after dialog opens
+    setTimeout(() => {
+      const inp = document.getElementById('fork-node-id');
+      if (inp) inp.value = nodeId;
+    }, 50);
+  }
+
   async function loadComparisons() {
     try {
-      const res = await fetch('/api/comparisons/available');
+      const taskParam = currentTaskName ? `?task=${encodeURIComponent(currentTaskName)}` : '';
+      const res = await fetch('/api/comparisons/available' + taskParam);
       const data = await res.json();
       const panel = document.getElementById('panel-comparisons');
       let html = '';
@@ -1816,6 +2546,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   async function showForkDialog() {
     const dialog = document.getElementById('fork-dialog');
+    const backdrop = document.getElementById('fork-dialog-backdrop');
+    // Show node info if a node is selected
+    const infoDiv = document.getElementById('fork-node-info');
+    if (selectedForkNode && treeNodesData[selectedForkNode]) {
+      const n = treeNodesData[selectedForkNode];
+      infoDiv.innerHTML = `<span style="color:${getProtocolColor(n.protocol)};">&#9632;</span> <strong>${selectedForkNode}</strong> — stage: ${n.stage_id}, protocol: ${n.protocol}, run: ${n.run_id}`;
+      infoDiv.style.display = 'block';
+      document.getElementById('fork-node-id').value = selectedForkNode;
+    } else {
+      infoDiv.style.display = 'none';
+    }
     // Populate protocol select
     const sel = document.getElementById('fork-protocol');
     sel.innerHTML = '';
@@ -1836,6 +2577,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         pipSel.appendChild(opt);
       });
     } catch(e) {}
+    if (backdrop) backdrop.style.display = 'block';
     dialog.style.display = 'block';
   }
 
@@ -1845,6 +2587,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const pipeline = document.getElementById('fork-pipeline').value;
     if (!nodeId) { alert('Enter a node ID'); return; }
     document.getElementById('fork-dialog').style.display = 'none';
+    const backdrop = document.getElementById('fork-dialog-backdrop');
+    if (backdrop) backdrop.style.display = 'none';
+    selectedForkNode = null;
     term.clear();
     term.writeln(`Forking from ${nodeId} with protocol ${protocol}...\\r\\n`);
     const body = {node_id: nodeId, protocol: protocol};
@@ -1871,6 +2616,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     '#06b6d4', '#f472b6', '#84cc16', '#fb923c', '#818cf8'
   ];
 
+  // Protocol color mapping for consistent colors across tree and viz
+  const protocolColorMap = {};
+  function getProtocolColor(proto) {
+    if (protocolColorMap[proto]) return protocolColorMap[proto];
+    const idx = Object.keys(protocolColorMap).length;
+    protocolColorMap[proto] = VIZ_COLORS[idx % VIZ_COLORS.length];
+    return protocolColorMap[proto];
+  }
+
   async function loadVizData() {
     if (vizLogsData && vizTasksData) return; // already loaded
     try {
@@ -1881,6 +2635,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       vizTasksData = (await tasksRes.json()).tasks || {};
       populateVizSelectors();
       populateDiffSelectors();
+      populateParetoSelectors();
     } catch(e) {
       console.error('Failed to load viz data:', e);
     }
@@ -1926,6 +2681,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const viewMode = document.getElementById('viz-viewmode').value;
     const showErrors = document.getElementById('viz-errorbars').checked;
     const coalesce = document.getElementById('viz-coalesce').checked;
+    const normalize = document.getElementById('viz-normalize').checked;
     const taskFilter = document.getElementById('viz-task').value;
 
     // Filter runs by task
@@ -1943,7 +2699,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     // Collect all protocols and stages
-    const protocols = [...new Set(runs.map(r => r.protocol))].sort();
+    // Include per-stage protocols (from stage_protocols map and stage-level fields)
+    const protocolSet = new Set();
+    runs.forEach(r => {
+      protocolSet.add(r.protocol);
+      const sp = r.stage_protocols || {};
+      Object.values(sp).forEach(p => protocolSet.add(p));
+      (r.stages || []).forEach(s => { if (s.protocol) protocolSet.add(s.protocol); });
+    });
+    const protocols = [...protocolSet].sort();
     let stageIds = [];
     runs.forEach(r => {
       (r.stages || []).forEach(s => {
@@ -1952,13 +2716,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     });
 
     // Build data index: {protocol -> {stage_id -> [values]}}
+    // Use per-stage protocol field (not run-level) so mixed-protocol runs
+    // attribute each stage's data to the correct protocol.
     const dataIndex = {};
     protocols.forEach(p => { dataIndex[p] = {}; });
     runs.forEach(r => {
-      const proto = r.protocol;
+      const sp = r.stage_protocols || {};
       (r.stages || []).forEach(s => {
         const val = s[metric];
         if (val == null) return;
+        // Per-stage protocol: check stage_protocols map, then stage-level field, then run-level
+        const proto = sp[s.stage_id] || s.protocol || r.protocol;
+        if (!dataIndex[proto]) dataIndex[proto] = {};
         if (!dataIndex[proto][s.stage_id]) dataIndex[proto][s.stage_id] = [];
         dataIndex[proto][s.stage_id].push(val);
       });
@@ -2001,31 +2770,90 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let labels, datasets;
 
     if (viewMode === 'cumulative') {
-      // Cumulative: one bar per protocol, aggregated across stages
+      // Cumulative: one bar per protocol, aggregated across stages.
+      // When normalize is on, values are expressed relative to the cross-protocol
+      // stage mean so that stages with different scales can be meaningfully averaged.
+      // For accuracy metrics, we convert to error rate (1 - accuracy) first.
       labels = protocols;
       const isRate = ['holdout_accuracy', 'training_accuracy', 'regression_rate'].includes(metric);
+      const isAccuracy = ['holdout_accuracy', 'training_accuracy'].includes(metric);
       const values = [];
       const errors = [];
+
+      // Step 1: Compute per-protocol per-stage means
+      const protoStageMeans = {}; // {proto -> {stage -> mean}}
       protocols.forEach(p => {
-        // Collect all values across all stages for this protocol
-        const allVals = [];
+        protoStageMeans[p] = {};
         stageIds.forEach(sid => {
-          (dataIndex[p][sid] || []).forEach(v => allVals.push(v));
+          const vals = dataIndex[p]?.[sid] || [];
+          if (vals.length > 0) {
+            let mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+            if (normalize && isAccuracy) mean = 1 - mean; // convert to error rate
+            protoStageMeans[p][sid] = mean;
+          }
         });
-        if (isRate) {
-          // For rates, compute mean of means per run
-          const s = stats(allVals);
-          values.push(s.mean);
-          errors.push(showErrors ? s.std : 0);
+      });
+
+      // Step 2: Compute per-stage grand means (average of per-protocol means)
+      const grandMeans = {};
+      stageIds.forEach(sid => {
+        const protoMeans = [];
+        protocols.forEach(p => {
+          if (protoStageMeans[p][sid] != null) protoMeans.push(protoStageMeans[p][sid]);
+        });
+        grandMeans[sid] = protoMeans.length > 0
+          ? protoMeans.reduce((a, b) => a + b, 0) / protoMeans.length
+          : 0;
+      });
+
+      protocols.forEach(p => {
+        if (isRate || normalize) {
+          // Bar height: mean of (optionally normalized) per-stage means
+          const stageMeans = [];
+          stageIds.forEach(sid => {
+            let vals = dataIndex[p]?.[sid] || [];
+            if (vals.length === 0) return;
+            let mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+            if (normalize && isAccuracy) mean = 1 - mean; // error rate
+            if (normalize && grandMeans[sid] > 0) mean = mean / grandMeans[sid];
+            stageMeans.push(mean);
+          });
+          const barHeight = stageMeans.length > 0
+            ? stageMeans.reduce((a, b) => a + b, 0) / stageMeans.length
+            : 0;
+          values.push(barHeight);
+
+          // Error bars: std of mean-normalized deviations
+          if (showErrors) {
+            const deviations = [];
+            stageIds.forEach(sid => {
+              const vals = dataIndex[p]?.[sid] || [];
+              const gm = grandMeans[sid];
+              vals.forEach(v => {
+                let val = normalize && isAccuracy ? (1 - v) : v;
+                if (normalize && gm > 0) val = val / gm;
+                deviations.push(val - (normalize && gm > 0 ? (gm / gm) : gm));
+              });
+            });
+            const devStats = stats(deviations);
+            errors.push(devStats.std);
+          } else {
+            errors.push(0);
+          }
         } else {
           // For absolute values, sum per run then average across runs
-          // Group by run
+          // Only include stages whose effective protocol matches p
           const perRun = {};
-          runs.filter(r => r.protocol === p).forEach(r => {
+          runs.forEach(r => {
+            const sp = r.stage_protocols || {};
             let total = 0;
+            let hasAny = false;
             (r.stages || []).forEach(s => {
-              if (s[metric] != null) total += s[metric];
+              const stageProto = sp[s.stage_id] || s.protocol || r.protocol;
+              if (stageProto !== p) return;
+              if (s[metric] != null) { total += s[metric]; hasAny = true; }
             });
+            if (!hasAny) return;
             perRun[r.run_id] = total;
           });
           const runTotals = Object.values(perRun);
@@ -2035,7 +2863,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       });
       datasets = [{
-        label: metric,
+        label: normalize ? `${metric} (normalized)` : metric,
         data: values,
         backgroundColor: VIZ_COLORS.slice(0, protocols.length),
         borderColor: VIZ_COLORS.slice(0, protocols.length),
@@ -2123,14 +2951,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           legend: { labels: { color: '#ccc' } },
           title: {
             display: true,
-            text: `${metric} ${viewMode === 'cumulative' ? '(cumulative)' : ''} ${coalesce ? '[coalesced by tags]' : ''}`,
+            text: `${metric} ${viewMode === 'cumulative' ? '(cumulative)' : ''} ${coalesce ? '[coalesced by tags]' : ''} ${normalize && viewMode === 'cumulative' ? '[normalized]' : ''}`,
             color: '#e0e0e0',
             font: { size: 14 },
           },
         },
         scales: {
           x: { ticks: { color: '#888', maxRotation: 45 }, grid: { color: '#0f3460' } },
-          y: { ticks: { color: '#888' }, grid: { color: '#0f3460' }, beginAtZero: true },
+          y: {
+            ticks: { color: '#888' },
+            grid: { color: '#0f3460' },
+            beginAtZero: true,
+            title: {
+              display: normalize && viewMode === 'cumulative',
+              text: normalize && ['holdout_accuracy', 'training_accuracy'].includes(metric)
+                ? 'relative error rate (1 = cross-protocol mean)'
+                : (normalize ? 'relative to cross-protocol stage mean' : ''),
+              color: '#aaa',
+              font: { size: 11 },
+            },
+          },
         },
       },
       plugins: [errorBarPlugin],
@@ -2159,21 +2999,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       taskSel.appendChild(opt);
     });
 
-    // Protocol selectors
+    // Baseline protocol selector
     const protocols = [...new Set(vizLogsData.map(r => r.protocol))].sort();
-    ['diff-treatment', 'diff-baseline'].forEach(selId => {
-      const sel = document.getElementById(selId);
-      sel.innerHTML = '';
-      protocols.forEach(p => {
-        const opt = document.createElement('option');
-        opt.value = p; opt.textContent = p;
-        sel.appendChild(opt);
-      });
+    const sel = document.getElementById('diff-baseline');
+    sel.innerHTML = '';
+    protocols.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p; opt.textContent = p;
+      sel.appendChild(opt);
     });
-    // Default baseline to first protocol if multiple
-    if (protocols.length >= 2) {
-      document.getElementById('diff-treatment').value = protocols[1] || protocols[0];
-      document.getElementById('diff-baseline').value = protocols[0];
+    if (protocols.length >= 1) {
+      sel.value = protocols[0];
     }
   }
 
@@ -2236,11 +3072,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   async function runDifferential() {
     const taskPath = document.getElementById('diff-task').value;
-    const treatment = document.getElementById('diff-treatment').value;
     const baseline = document.getElementById('diff-baseline').value;
 
     if (!taskPath) { alert('Select a task first.'); return; }
-    if (treatment === baseline) { alert('Treatment and baseline must be different protocols.'); return; }
 
     const task = vizTasksData[taskPath];
     const groupA = [];
@@ -2275,7 +3109,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           task: taskPath,
           group_a: groupA,
           group_b: groupB,
-          treatment: treatment,
           baseline: baseline,
           metrics: metrics,
         }),
@@ -2294,72 +3127,101 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   function renderDiffResults(data) {
     const resultsDiv = document.getElementById('diff-results');
     let html = '';
+    const treatments = data.treatment_protocols || [];
 
     // Summary card
     const aStr = data.group_a.join(', ');
     const bStr = data.group_b.join(', ');
     html += `<div class="diff-result-card">
-      <div class="diff-result-header">Differential: ${data.treatment_protocol} vs ${data.baseline_protocol}</div>
+      <div class="diff-result-header">Differential: ${treatments.length} treatment${treatments.length !== 1 ? 's' : ''} vs ${data.baseline_protocol}</div>
       <div class="diff-stat"><span class="label">Group A (treatment)</span><span class="value">${aStr}</span></div>
       <div class="diff-stat"><span class="label">Group B (measured)</span><span class="value">${bStr}</span></div>
+      <div class="diff-stat"><span class="label">Treatments</span><span class="value">${treatments.join(', ')}</span></div>
     </div>`;
+
+    // Matched runs card
+    html += '<div class="diff-result-card"><div class="diff-result-header">Matched Runs</div>';
+    treatments.forEach(tp => {
+      const tRuns = (data.treatment_runs || {})[tp] || [];
+      html += `<div class="diff-stat"><span class="label">${tp}</span><span class="value">${tRuns.length > 0 ? tRuns.map(r => r.run_id).join(', ') : 'none'}</span></div>`;
+    });
+    const bRuns = data.baseline_runs || [];
+    html += `<div class="diff-stat"><span class="label">Baseline (${data.baseline_protocol})</span><span class="value">${bRuns.length > 0 ? bRuns.map(r => r.run_id).join(', ') : 'none'}</span></div>`;
+    html += '</div>';
 
     // Per-metric results
     const metricNames = Object.keys(data.results || {});
     metricNames.forEach(metric => {
       const r = data.results[metric];
-      const t = r.treatment;
       const b = r.baseline;
-      const hasTreatment = t.mean !== null && t.mean !== undefined;
       const hasBaseline = b.mean !== null && b.mean !== undefined;
 
       html += `<div class="diff-result-card">
         <div class="diff-result-header">${metric}</div>`;
 
-      if (hasTreatment && hasBaseline) {
-        const delta = r.delta;
-        const deltaStr = delta > 0 ? `+${delta.toFixed(4)}` : delta.toFixed(4);
-        const deltaClass = delta > 0 ? 'diff-delta-positive' : (delta < 0 ? 'diff-delta-negative' : '');
-        const isGoodPositive = ['holdout_accuracy', 'training_accuracy'].includes(metric);
-        const isGoodNegative = ['regression_rate', 'effective_tokens', 'wall_time_seconds', 'human_time_seconds', 'code_lines'].includes(metric);
-
-        html += `
-          <div class="diff-stat"><span class="label">Treatment (n=${t.n})</span><span class="value">${t.mean.toFixed(4)} \\u00b1 ${t.std.toFixed(4)}</span></div>
-          <div class="diff-stat"><span class="label">Baseline (n=${b.n})</span><span class="value">${b.mean.toFixed(4)} \\u00b1 ${b.std.toFixed(4)}</span></div>
-          <div class="diff-stat"><span class="label">Delta</span><span class="value ${deltaClass}" style="font-size:15px;font-weight:700;">${deltaStr}</span></div>`;
+      if (hasBaseline) {
+        html += `<div class="diff-stat"><span class="label">Baseline (${data.baseline_protocol}, n=${b.n})</span><span class="value">${b.mean.toFixed(4)} \\u00b1 ${b.std.toFixed(4)}</span></div>`;
       } else {
-        if (!hasTreatment) html += '<div class="diff-stat"><span class="label">Treatment</span><span class="value" style="color:#ef4444;">No data</span></div>';
-        if (!hasBaseline) html += '<div class="diff-stat"><span class="label">Baseline</span><span class="value" style="color:#ef4444;">No data</span></div>';
+        html += '<div class="diff-stat"><span class="label">Baseline</span><span class="value" style="color:#ef4444;">No data</span></div>';
       }
+
+      treatments.forEach(tp => {
+        const tData = (r.treatments || {})[tp];
+        if (!tData) return;
+        const t = tData.stats;
+        const hasTreatment = t.mean !== null && t.mean !== undefined;
+        if (hasTreatment && hasBaseline) {
+          const delta = tData.delta;
+          const deltaStr = delta > 0 ? '+' + delta.toFixed(4) : delta.toFixed(4);
+          const deltaClass = delta > 0 ? 'diff-delta-positive' : (delta < 0 ? 'diff-delta-negative' : '');
+          html += `<div class="diff-stat"><span class="label">${tp} (n=${t.n})</span><span class="value">${t.mean.toFixed(4)} \\u00b1 ${t.std.toFixed(4)} &nbsp; <span class="${deltaClass}" style="font-weight:700;">${deltaStr}</span></span></div>`;
+        } else if (!hasTreatment) {
+          html += `<div class="diff-stat"><span class="label">${tp}</span><span class="value" style="color:#ef4444;">No data</span></div>`;
+        }
+      });
       html += '</div>';
     });
 
-    // Chart for metrics
-    html += '<div class="diff-result-card"><div style="position:relative;height:300px;"><canvas id="diff-chart"></canvas></div></div>';
+    // Per-metric charts
+    html += `<div class="diff-result-card" style="font-size:12px;color:#888;">
+      Bars show mean metric values on B stages only (stages ${bStr}).
+      Each treatment bar = B-stage values from runs using that protocol on A stages (${aStr}) and ${data.baseline_protocol} on B.
+      Baseline bar = B-stage values from runs using ${data.baseline_protocol} on all stages.
+    </div>`;
+    metricNames.forEach((m, mi) => {
+      html += `<div class="diff-result-card"><div style="position:relative;height:220px;"><canvas id="diff-chart-${mi}"></canvas></div></div>`;
+    });
 
     // Missing runs
     if (data.missing && data.missing.length > 0) {
       html += '<div class="diff-missing"><div class="diff-missing-title">Missing Runs</div>';
       data.missing.forEach(m => {
-        html += `<div class="diff-missing-item">${m.description}</div>`;
+        html += `<div class="diff-missing-item">
+          <div>${m.description}</div>`;
+        if (m.fork_hint) {
+          html += `<div style="margin-top:6px;padding:8px;background:#1a1a2e;border-radius:6px;font-size:12px;">
+            <div style="color:#4ade80;margin-bottom:4px;">Setup: ${m.fork_hint.explanation}</div>
+            <div style="color:#888;">A stages: [${m.fork_hint.a_stages.join(', ')}] → ${m.fork_hint.a_protocol}</div>
+            <div style="color:#888;">B stages: [${m.fork_hint.b_stages.join(', ')}] → ${m.fork_hint.b_protocol}</div>
+            <button class="btn-secondary" style="margin-top:6px;font-size:11px;padding:4px 10px;"
+              onclick="setupDiffFork('${m.fork_hint.a_protocol}', '${m.fork_hint.b_protocol}')">Set Up This Run</button>
+          </div>`;
+        }
+        html += '</div>';
       });
       html += '</div>';
     }
 
     resultsDiv.innerHTML = html;
 
-    // Render diff chart
-    const ctx = document.getElementById('diff-chart');
-    if (!ctx) return;
-    if (diffChart) diffChart.destroy();
+    // Render per-metric diff charts
+    if (diffChart) { diffChart.forEach(c => c.destroy()); }
+    diffChart = [];
 
-    const chartLabels = metricNames;
-    const treatmentVals = metricNames.map(m => data.results[m].treatment.mean || 0);
-    const baselineVals = metricNames.map(m => data.results[m].baseline.mean || 0);
-    const treatmentErrs = metricNames.map(m => data.results[m].treatment.std || 0);
-    const baselineErrs = metricNames.map(m => data.results[m].baseline.std || 0);
+    const TREATMENT_COLORS = ['#e94560', '#f59e0b', '#10b981', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+    const BASELINE_COLOR = '#3b82f6';
 
-    const errorBarPlugin = {
+    const diffErrorBarPlugin = {
       id: 'diffErrorBars',
       afterDatasetsDraw(chart) {
         const { ctx: c, scales: { x, y } } = chart;
@@ -2391,48 +3253,483 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     };
 
-    diffChart = new Chart(ctx.getContext('2d'), {
-      type: 'bar',
+    metricNames.forEach((m, mi) => {
+      const ctx = document.getElementById(`diff-chart-${mi}`);
+      if (!ctx) return;
+      const r = data.results[m];
+
+      const labels = [...treatments, `Baseline (${data.baseline_protocol})`];
+      const values = treatments.map(tp => ((r.treatments[tp] || {}).stats || {}).mean || 0);
+      values.push(r.baseline.mean || 0);
+      const errors = treatments.map(tp => ((r.treatments[tp] || {}).stats || {}).std || 0);
+      errors.push(r.baseline.std || 0);
+      const bgColors = treatments.map((_, i) => TREATMENT_COLORS[i % TREATMENT_COLORS.length] + 'cc');
+      bgColors.push(BASELINE_COLOR + 'cc');
+      const borderColors = treatments.map((_, i) => TREATMENT_COLORS[i % TREATMENT_COLORS.length]);
+      borderColors.push(BASELINE_COLOR);
+
+      const chart = new Chart(ctx.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: m,
+            data: values,
+            backgroundColor: bgColors,
+            borderColor: borderColors,
+            borderWidth: 1,
+            errorBars: errors,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            title: { display: true, text: m, color: '#e0e0e0', font: { size: 13 } },
+          },
+          scales: {
+            x: { ticks: { color: '#888' }, grid: { color: '#0f3460' } },
+            y: {
+              ticks: { color: '#888' },
+              grid: { color: '#0f3460' },
+              beginAtZero: true,
+              title: { display: true, text: m, color: '#aaa', font: { size: 11 } },
+            },
+          },
+        },
+        plugins: [diffErrorBarPlugin],
+      });
+      diffChart.push(chart);
+    });
+  }
+
+  function setupDiffFork(aProto, bProto) {
+    switchTab('experiment');
+    showForkDialog();
+    // Provide guidance in the fork dialog
+    setTimeout(() => {
+      const nodeInput = document.getElementById('fork-node-id');
+      if (nodeInput) {
+        nodeInput.placeholder = `Select a node, then set pipeline: A=${aProto}, B=${bProto}`;
+      }
+    }, 100);
+  }
+
+  // ---- Pareto Analysis ----
+
+  const METRIC_DEFAULTS = {
+    'holdout_accuracy': 'higher', 'training_accuracy': 'higher',
+    'regression_rate': 'lower', 'effective_tokens': 'lower',
+    'total_tokens': 'lower', 'output_tokens': 'lower',
+    'wall_time_seconds': 'lower', 'human_time_seconds': 'lower',
+    'code_lines': 'lower', 'input_tokens': 'lower',
+    'cache_creation_tokens': 'lower', 'cache_read_tokens': 'lower',
+  };
+
+  function populateParetoSelectors() {
+    // Task selector
+    const taskSel = document.getElementById('pareto-task');
+    taskSel.innerHTML = '<option value="">All Tasks</option>';
+    const taskNames = new Set();
+    vizLogsData.forEach(r => { if (r.task) taskNames.add(r.task); });
+    Object.keys(vizTasksData).forEach(t => taskNames.add(t));
+    [...taskNames].sort().forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = vizTasksData[t]?.name || t.split('/').pop();
+      taskSel.appendChild(opt);
+    });
+
+    // Baseline protocol selector
+    const protocols = [...new Set(vizLogsData.map(r => r.protocol))].sort();
+    const baseSel = document.getElementById('pareto-baseline');
+    baseSel.innerHTML = '';
+    protocols.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p; opt.textContent = p;
+      baseSel.appendChild(opt);
+    });
+
+    // Set default directions based on initial metric selections
+    paretoSetDefaultDir('x');
+    paretoSetDefaultDir('y');
+
+    // Listen for metric changes to auto-set direction
+    document.getElementById('pareto-x-metric').addEventListener('change', () => paretoSetDefaultDir('x'));
+    document.getElementById('pareto-y-metric').addEventListener('change', () => paretoSetDefaultDir('y'));
+  }
+
+  function paretoSetDefaultDir(axis) {
+    const metric = document.getElementById(`pareto-${axis}-metric`).value;
+    const dirSel = document.getElementById(`pareto-${axis}-dir`);
+    dirSel.value = METRIC_DEFAULTS[metric] || 'lower';
+  }
+
+  function paretoTaskChanged() {
+    const taskPath = document.getElementById('pareto-task').value;
+    const stageFilter = document.getElementById('pareto-stage-filter');
+    stageFilter.innerHTML = '<option value="">All stages</option>';
+
+    if (!taskPath) return;
+    const task = vizTasksData[taskPath];
+    if (!task || !task.stages) return;
+
+    // Add per-stage options
+    task.stages.forEach((s, i) => {
+      const opt = document.createElement('option');
+      opt.value = 'stage:' + s.id;
+      opt.textContent = `Stage: ${s.id}`;
+      stageFilter.appendChild(opt);
+    });
+
+    // Add tag options (from domain_tags and pipeline_tags)
+    const allTags = new Set(task.domain_tags || []);
+    task.stages.forEach(s => (s.pipeline_tags || []).forEach(t => allTags.add(t)));
+    // Also gather pipeline-level tags
+    Object.values(task.pipelines || {}).forEach(p => {
+      (p.pipeline_tags || []).forEach(t => allTags.add(t));
+    });
+    [...allTags].sort().forEach(tag => {
+      const opt = document.createElement('option');
+      opt.value = 'tag:' + tag;
+      opt.textContent = `Tag: ${tag}`;
+      stageFilter.appendChild(opt);
+    });
+
+    // Also rebuild the differential stage selector
+    paretoBuildDiffStages(task);
+  }
+
+  function paretoBuildDiffStages(task) {
+    const container = document.getElementById('pareto-stage-selector');
+    const presets = document.getElementById('pareto-presets');
+    container.innerHTML = '';
+    presets.innerHTML = '';
+    if (!task || !task.stages) return;
+
+    task.stages.forEach((stage, idx) => {
+      const row = document.createElement('div');
+      row.className = 'diff-stage-row';
+      const name = `pareto_sg_${idx}`;
+      row.innerHTML = `
+        <span class="diff-stage-name">${idx + 1}. ${stage.id}</span>
+        <div class="diff-radio-group">
+          <label><input type="radio" name="${name}" value="a"> A</label>
+          <label><input type="radio" name="${name}" value="b"> B</label>
+          <label><input type="radio" name="${name}" value="" checked> --</label>
+        </div>
+      `;
+      container.appendChild(row);
+    });
+
+    const n = task.stages.length;
+    for (let k = 1; k < n; k++) {
+      const aStr = Array.from({length: k}, (_, i) => i + 1).join(',');
+      const btn = document.createElement('button');
+      btn.className = 'diff-preset-btn';
+      btn.textContent = `A={${aStr}};B={${k + 1}}`;
+      btn.onclick = () => {
+        task.stages.forEach((_, idx) => {
+          const radios = document.querySelectorAll(`input[name="pareto_sg_${idx}"]`);
+          radios.forEach(r => {
+            if (idx < k && r.value === 'a') r.checked = true;
+            else if (idx === k && r.value === 'b') r.checked = true;
+            else if (r.value === '') r.checked = (idx > k || (idx >= k && idx !== k));
+          });
+        });
+      };
+      presets.appendChild(btn);
+    }
+  }
+
+  function paretoModeChanged() {
+    const xDiff = document.getElementById('pareto-x-mode').value === 'differential';
+    const yDiff = document.getElementById('pareto-y-mode').value === 'differential';
+    document.getElementById('pareto-diff-config').style.display = (xDiff || yDiff) ? 'block' : 'none';
+  }
+
+  function paretoGetDiffGroups() {
+    const taskPath = document.getElementById('pareto-task').value;
+    const task = vizTasksData[taskPath];
+    if (!task) return { a: [], b: [] };
+    const a = [], b = [];
+    task.stages.forEach((s, idx) => {
+      const sel = document.querySelector(`input[name="pareto_sg_${idx}"]:checked`);
+      if (sel && sel.value === 'a') a.push(s.id);
+      else if (sel && sel.value === 'b') b.push(s.id);
+    });
+    return { a, b };
+  }
+
+  function matchStageId(logStageId, targetId) {
+    return logStageId === targetId || logStageId.endsWith('_' + targetId);
+  }
+
+  function paretoComputeRaw(protocol, metric, runs, stageFilterVal) {
+    const protoRuns = runs.filter(r => r.protocol === protocol);
+    const values = [];
+    protoRuns.forEach(r => {
+      (r.stages || []).forEach(s => {
+        if (s.skipped) return;
+        if (stageFilterVal) {
+          if (stageFilterVal.startsWith('stage:')) {
+            const sid = stageFilterVal.slice(6);
+            if (!matchStageId(s.stage_id, sid)) return;
+          } else if (stageFilterVal.startsWith('tag:')) {
+            // Tag filtering: include stages whose pipeline_tags contain this tag
+            const tag = stageFilterVal.slice(4);
+            const taskPath = document.getElementById('pareto-task').value;
+            const task = vizTasksData[taskPath];
+            if (task) {
+              const stageConf = task.stages.find(ts =>
+                matchStageId(s.stage_id, ts.id)
+              );
+              if (!stageConf || !(stageConf.pipeline_tags || []).includes(tag)) return;
+            }
+          }
+        }
+        const val = s[metric];
+        if (val != null) values.push(val);
+      });
+    });
+    if (values.length === 0) return null;
+    return values.reduce((a, b) => a + b, 0) / values.length;
+  }
+
+  function paretoComputeDiff(protocol, metric, runs, baselineProto, aStages, bStages) {
+    if (protocol === baselineProto) return 0; // baseline is the reference
+
+    function getStageProto(log, stageId) {
+      const sp = log.stage_protocols || {};
+      if (sp[stageId]) return sp[stageId];
+      for (const s of (log.stages || [])) {
+        if (matchStageId(s.stage_id, stageId))
+          return s.protocol || log.protocol;
+      }
+      return log.protocol;
+    }
+
+    // Treatment runs: protocol on A, baseline on B
+    const treatmentBVals = [];
+    // Baseline runs: baseline on all A+B
+    const baselineBVals = [];
+
+    runs.forEach(log => {
+      const protoMap = {};
+      [...aStages, ...bStages].forEach(sid => {
+        protoMap[sid] = getStageProto(log, sid);
+      });
+
+      const aTreatment = aStages.every(s => protoMap[s] === protocol);
+      const bBaseline = bStages.every(s => protoMap[s] === baselineProto);
+      const allBaseline = [...aStages, ...bStages].every(s => protoMap[s] === baselineProto);
+
+      if (aTreatment && bBaseline) {
+        bStages.forEach(sid => {
+          const stage = (log.stages || []).find(s => matchStageId(s.stage_id, sid));
+          if (stage && stage[metric] != null) treatmentBVals.push(stage[metric]);
+        });
+      }
+      if (allBaseline) {
+        bStages.forEach(sid => {
+          const stage = (log.stages || []).find(s => matchStageId(s.stage_id, sid));
+          if (stage && stage[metric] != null) baselineBVals.push(stage[metric]);
+        });
+      }
+    });
+
+    if (treatmentBVals.length === 0 || baselineBVals.length === 0) return null;
+    const tMean = treatmentBVals.reduce((a, b) => a + b, 0) / treatmentBVals.length;
+    const bMean = baselineBVals.reduce((a, b) => a + b, 0) / baselineBVals.length;
+    return tMean - bMean;
+  }
+
+  function computeParetoFront(points, xHigherBetter, yHigherBetter) {
+    const valid = points.filter(p => p.x != null && p.y != null && !isNaN(p.x) && !isNaN(p.y));
+    if (valid.length === 0) return [];
+
+    // Sort by x: best first
+    valid.sort((a, b) => xHigherBetter ? b.x - a.x : a.x - b.x);
+
+    const front = [];
+    let bestY = yHigherBetter ? -Infinity : Infinity;
+    for (const p of valid) {
+      const dominated = yHigherBetter ? (p.y < bestY) : (p.y > bestY);
+      if (!dominated) {
+        front.push(p);
+        bestY = p.y;
+      }
+    }
+
+    // Sort front by x for drawing
+    front.sort((a, b) => a.x - b.x);
+    return front;
+  }
+
+  function renderParetoChart() {
+    if (!vizLogsData) { alert('No data loaded yet.'); return; }
+
+    const taskFilter = document.getElementById('pareto-task').value;
+    const stageFilterVal = document.getElementById('pareto-stage-filter').value;
+    const xMetric = document.getElementById('pareto-x-metric').value;
+    const yMetric = document.getElementById('pareto-y-metric').value;
+    const xMode = document.getElementById('pareto-x-mode').value;
+    const yMode = document.getElementById('pareto-y-mode').value;
+    const xDir = document.getElementById('pareto-x-dir').value;
+    const yDir = document.getElementById('pareto-y-dir').value;
+    const baselineProto = document.getElementById('pareto-baseline').value;
+
+    const needsDiff = xMode === 'differential' || yMode === 'differential';
+    let aStages = [], bStages = [];
+    if (needsDiff) {
+      if (!taskFilter) { alert('Select a task for differential mode.'); return; }
+      const groups = paretoGetDiffGroups();
+      aStages = groups.a;
+      bStages = groups.b;
+      if (aStages.length === 0 || bStages.length === 0) {
+        alert('Assign at least one stage to group A and one to group B.'); return;
+      }
+    }
+
+    // Filter runs
+    let runs = vizLogsData;
+    if (taskFilter) {
+      runs = runs.filter(r => {
+        const rt = (r.task || '').replace(/\\/$/, '');
+        return rt === taskFilter || rt.endsWith('/' + taskFilter.split('/').pop());
+      });
+    }
+
+    // Get protocols
+    const protocols = [...new Set(runs.map(r => r.protocol))].sort();
+
+    // Compute points
+    const points = [];
+    const skipped = [];
+    protocols.forEach(proto => {
+      const x = xMode === 'differential'
+        ? paretoComputeDiff(proto, xMetric, runs, baselineProto, aStages, bStages)
+        : paretoComputeRaw(proto, xMetric, runs, stageFilterVal);
+      const y = yMode === 'differential'
+        ? paretoComputeDiff(proto, yMetric, runs, baselineProto, aStages, bStages)
+        : paretoComputeRaw(proto, yMetric, runs, stageFilterVal);
+
+      if (x == null || y == null) {
+        skipped.push(proto);
+      } else {
+        points.push({ protocol: proto, x, y });
+      }
+    });
+
+    if (points.length === 0) {
+      document.getElementById('pareto-info').textContent = 'No data points. Check filters and ensure runs exist.';
+      return;
+    }
+
+    // Compute Pareto front
+    const front = computeParetoFront(points, xDir === 'higher', yDir === 'higher');
+
+    // Build axis labels
+    const xLabel = xMode === 'differential' ? `Δ ${xMetric}` : xMetric;
+    const yLabel = yMode === 'differential' ? `Δ ${yMetric}` : yMetric;
+
+    // Chart.js datasets
+    const scatterData = points.map(p => ({ x: p.x, y: p.y }));
+    const frontData = front.map(p => ({ x: p.x, y: p.y }));
+
+    // Plugin to label points
+    const pointLabelPlugin = {
+      id: 'paretoPointLabels',
+      afterDatasetsDraw(chart) {
+        const meta = chart.getDatasetMeta(0);
+        const c = chart.ctx;
+        c.font = '11px system-ui, sans-serif';
+        c.fillStyle = '#ccc';
+        c.textAlign = 'left';
+        c.textBaseline = 'bottom';
+        meta.data.forEach((pt, i) => {
+          if (i < points.length) {
+            c.fillText(points[i].protocol, pt.x + 8, pt.y - 6);
+          }
+        });
+      }
+    };
+
+    const ctx = document.getElementById('pareto-chart').getContext('2d');
+    if (paretoChart) paretoChart.destroy();
+
+    paretoChart = new Chart(ctx, {
+      type: 'scatter',
       data: {
-        labels: chartLabels,
         datasets: [
           {
-            label: `Treatment (${data.treatment_protocol})`,
-            data: treatmentVals,
-            backgroundColor: '#e94560cc',
-            borderColor: '#e94560',
-            borderWidth: 1,
-            errorBars: treatmentErrs,
+            label: 'Protocols',
+            data: scatterData,
+            backgroundColor: points.map(p => getProtocolColor(p.protocol)),
+            borderColor: points.map(p => getProtocolColor(p.protocol)),
+            pointRadius: 8,
+            pointHoverRadius: 11,
           },
           {
-            label: `Baseline (${data.baseline_protocol})`,
-            data: baselineVals,
-            backgroundColor: '#3b82f6cc',
-            borderColor: '#3b82f6',
-            borderWidth: 1,
-            errorBars: baselineErrs,
-          },
-        ],
+            label: 'Pareto Front',
+            data: frontData,
+            type: 'line',
+            borderColor: '#22c55eaa',
+            borderDash: [6, 3],
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            tension: 0,
+          }
+        ]
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
         plugins: {
           legend: { labels: { color: '#ccc' } },
-          title: { display: true, text: 'Treatment vs Baseline', color: '#e0e0e0' },
+          title: { display: true, text: `${yLabel} vs ${xLabel}`, color: '#e0e0e0', font: { size: 14 } },
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                if (ctx.datasetIndex === 0 && ctx.dataIndex < points.length) {
+                  const p = points[ctx.dataIndex];
+                  return `${p.protocol}: (${p.x.toFixed(4)}, ${p.y.toFixed(4)})`;
+                }
+                return '';
+              }
+            }
+          }
         },
         scales: {
-          x: { ticks: { color: '#888' }, grid: { color: '#0f3460' } },
-          y: { ticks: { color: '#888' }, grid: { color: '#0f3460' }, beginAtZero: true },
-        },
+          x: {
+            title: { display: true, text: xLabel + (xDir === 'lower' ? ' (lower is better)' : ' (higher is better)'), color: '#888' },
+            ticks: { color: '#888' }, grid: { color: '#0f3460' },
+          },
+          y: {
+            title: { display: true, text: yLabel + (yDir === 'higher' ? ' (higher is better)' : ' (lower is better)'), color: '#888' },
+            ticks: { color: '#888' }, grid: { color: '#0f3460' },
+          },
+        }
       },
-      plugins: [errorBarPlugin],
+      plugins: [pointLabelPlugin],
     });
+
+    // Info panel
+    let info = `${points.length} protocol${points.length !== 1 ? 's' : ''} plotted, ${front.length} on Pareto front.`;
+    if (front.length > 0) {
+      info += '\\nFront: ' + front.map(p => p.protocol).join(', ');
+    }
+    if (skipped.length > 0) {
+      info += '\\nSkipped (no data): ' + skipped.join(', ');
+    }
+    document.getElementById('pareto-info').textContent = info;
   }
 
-  // Init
+  // Init — load protocols first since buildStageProtocolList needs protocolsData
   initTerminal();
-  loadProtocols();
+  loadProtocols().then(() => loadTasks());
   refreshState();
   loadTree();
   loadComparisons();
@@ -2445,20 +3742,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
-def launch_ui(task_dir: str, protocol_name: str = None, host: str = "0.0.0.0",
+def launch_ui(task_dir: str = None, protocol_name: str = None, host: str = "0.0.0.0",
               port: int = 8765, **kwargs):
     """Store config for deferred init and start the web server."""
     import uvicorn
 
     state["task_dir"] = task_dir
+    state["current_task_name"] = Path(task_dir).name if task_dir else None
     state["launch_kwargs"] = {
         k: v for k, v in kwargs.items()
         if k in ("engine_cmd", "model", "run_id", "work_dir", "log_dir")
     }
     state["default_protocol"] = protocol_name
 
-    # If protocol was provided via CLI, initialize immediately
-    if protocol_name:
+    # Migrate legacy root-level logs into per-task subdirectories
+    _migrate_legacy_logs()
+
+    # If both task and protocol were provided via CLI, initialize immediately
+    if task_dir and protocol_name:
         init_experiment(task_dir, protocol_name, **state["launch_kwargs"])
 
     print(f"\n  Experiment UI: http://localhost:{port}\n")

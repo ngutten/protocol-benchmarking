@@ -1,8 +1,13 @@
-"""Metric collection for MiniDB benchmark harness."""
+"""Metric collection for benchmark harness.
+
+Collects training, holdout, regression, and performance metrics for each stage.
+Performance tests live in tests/perf/ and are auto-discovered by stage ID prefix.
+"""
 import subprocess
 import json
 import os
 import re
+import time as _time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -14,6 +19,18 @@ class TestResult:
     duration: float = 0.0
     stage: str = ""
     pool: str = ""  # training, holdout, regression
+
+
+@dataclass
+class PerfResult:
+    """Result from a single performance benchmark function."""
+    name: str
+    duration_seconds: float
+    iterations: int = 1
+    ops_per_second: float = 0.0
+    stage: str = ""
+    passed: bool = True
+    error: str = ""
 
 
 @dataclass
@@ -33,6 +50,9 @@ class StageMetrics:
     holdout_tests_passed: int = 0
     regression_tests_total: int = 0
     regression_tests_failed: int = 0
+    perf_tests_total: int = 0
+    perf_tests_passed: int = 0
+    perf_results: list = field(default_factory=list)
     code_lines: int = 0
     code_bytes: int = 0
     git_commit: str = ""
@@ -68,6 +88,19 @@ class StageMetrics:
                 + self.cache_creation_tokens
                 + int(self.cache_read_tokens * 0.1))
 
+    def perf_mean_duration(self):
+        """Mean duration across all perf benchmarks (seconds)."""
+        passed = [p for p in self.perf_results if isinstance(p, dict) and p.get("passed", True)]
+        if not passed:
+            passed = [p for p in self.perf_results if isinstance(p, PerfResult) and p.passed]
+        if not passed:
+            return None
+        durations = []
+        for p in passed:
+            d = p["duration_seconds"] if isinstance(p, dict) else p.duration_seconds
+            durations.append(d)
+        return sum(durations) / len(durations) if durations else None
+
     def to_dict(self):
         d = asdict(self)
         d["training_accuracy"] = self.training_accuracy()
@@ -75,6 +108,7 @@ class StageMetrics:
         d["regression_rate"] = self.regression_rate()
         d["token_cost"] = self.total_tokens  # backward compat key
         d["effective_tokens"] = self.effective_tokens()
+        d["perf_mean_duration"] = self.perf_mean_duration()
         return d
 
 
@@ -97,6 +131,127 @@ def run_pytest(test_path, engine_cmd, conftest_dir=None, timeout=120):
                 name=m.group(1), passed=(m.group(2) == "PASSED"),
             ))
     return tests, result.returncode
+
+
+def run_perf_tests(test_path, engine_cmd, conftest_dir=None, timeout=300):
+    """Run performance benchmark tests and return timing results.
+
+    Perf tests are standard pytest files in tests/perf/. Each test function
+    exercises a workload and reports metrics by printing a JSON line to stdout:
+
+        {
+          "bench_metric": "ops_per_second",
+          "test": "test_function_name",
+          "value": 1234.5,
+          "iterations": 1000,
+          "duration_seconds": 0.812345
+        }
+
+    Fields:
+        bench_metric: Always "ops_per_second" (the metric type).
+        test: Name of the test function (matched against pytest's test ID).
+        value: Operations per second (iterations / duration).
+        iterations: Number of loop iterations in the benchmark.
+        duration_seconds: Wall-clock time for the benchmark loop (preferred
+            over pytest's --durations output for accuracy).
+
+    Duration is also captured from pytest's --durations output as a fallback,
+    but test-reported duration_seconds takes precedence.
+
+    Returns:
+        list[PerfResult]: One entry per test, with captured duration.
+    """
+    env = os.environ.copy()
+    env["MINIDB_ENGINE_CMD"] = engine_cmd
+    cmd = [
+        "python3", "-m", "pytest", test_path,
+        "-v", "-s", "--tb=short", "--durations=0",
+    ]
+    if conftest_dir:
+        cmd.extend(["--rootdir", conftest_dir, "-c", "/dev/null"])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                                timeout=timeout + 30)
+    except subprocess.TimeoutExpired:
+        return [PerfResult(name=test_path, duration_seconds=timeout,
+                           passed=False, error="timeout")]
+
+    results = []
+
+    # Parse test pass/fail from verbose output.
+    # With -s (no capture), pytest may split test name and status across lines:
+    #   test_file.py::TestClass::test_name {stdout}
+    #   PASSED
+    test_status = {}
+    current_test = None
+    for line in result.stdout.splitlines():
+        # Same-line match (no -s, or no stdout from test)
+        m = re.match(r"(.+::\S+)\s+(PASSED|FAILED|ERROR|SKIPPED)", line)
+        if m:
+            test_status[m.group(1)] = m.group(2)
+            current_test = None
+            continue
+        # Test name at start of line (with -s, stdout follows on same/next lines)
+        m = re.match(r"(.+::\S+)\s", line)
+        if m and "::" in m.group(1) and "/" in m.group(1):
+            current_test = m.group(1)
+            continue
+        # Standalone status line (with -s)
+        stripped = line.strip()
+        if current_test and stripped in ("PASSED", "FAILED", "ERROR", "SKIPPED"):
+            test_status[current_test] = stripped
+            current_test = None
+
+    # Parse durations from pytest's --durations output
+    # Format: "N.NNs call     test_file.py::TestClass::test_name"
+    duration_map = {}
+    in_durations = False
+    for line in result.stdout.splitlines():
+        if "slowest durations" in line or "= slowest" in line:
+            in_durations = True
+            continue
+        if in_durations:
+            m = re.match(r"\s*([\d.]+)s\s+\w+\s+(.+::\S+)", line)
+            if m:
+                duration_map[m.group(2)] = float(m.group(1))
+            elif line.strip().startswith("="):
+                in_durations = False
+
+    # Build PerfResult for each test
+    for test_name, status in test_status.items():
+        duration = duration_map.get(test_name, 0.0)
+        results.append(PerfResult(
+            name=test_name,
+            duration_seconds=duration,
+            passed=(status == "PASSED"),
+            error="" if status == "PASSED" else status,
+        ))
+
+    # Check for custom bench_metric JSON in stdout.
+    # With -s, the JSON may appear mid-line after the test name, so we
+    # extract the first { ... } substring containing "bench_metric".
+    for line in result.stdout.splitlines():
+        if "bench_metric" not in line:
+            continue
+        # Find the JSON object in the line
+        brace_start = line.find("{")
+        if brace_start == -1:
+            continue
+        json_str = line[brace_start:]
+        try:
+            data = json.loads(json_str)
+            # Find matching result and enrich it
+            for r in results:
+                if data.get("test") and data["test"] in r.name:
+                    r.iterations = data.get("iterations", 1)
+                    r.ops_per_second = data.get("value", 0.0)
+                    # Prefer test-reported duration over pytest --durations
+                    if data.get("duration_seconds"):
+                        r.duration_seconds = data["duration_seconds"]
+        except json.JSONDecodeError:
+            pass
+
+    return results
 
 
 def count_code(project_dir, extensions=(".py", ".cpp", ".cc", ".h", ".hpp", ".rs", ".ts", ".js")):
@@ -162,6 +317,21 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
                 metrics.test_results.extend(results)
     metrics.regression_tests_total = reg_total
     metrics.regression_tests_failed = reg_failed
+
+    # Performance tests (holdout — never shown to LLM)
+    pp = os.path.join(test_dir, "perf")
+    if os.path.isdir(pp):
+        for f in sorted(os.listdir(pp)):
+            if not f.endswith(".py") or f.startswith("__"):
+                continue
+            # Match by stage_id or numeric prefix, same as holdout
+            if stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f)):
+                perf_results = run_perf_tests(os.path.join(pp, f), engine_cmd, conftest_dir)
+                metrics.perf_tests_total += len(perf_results)
+                metrics.perf_tests_passed += sum(1 for r in perf_results if r.passed)
+                for r in perf_results:
+                    r.stage = stage_id
+                metrics.perf_results.extend(perf_results)
 
     # Git info
     try:

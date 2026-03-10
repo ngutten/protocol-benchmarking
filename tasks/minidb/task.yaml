@@ -18,12 +18,14 @@ stages:
     type: feature_addition
     training_tests: tests/training/test_01_select_where.py
     holdout_tests: tests/holdout/test_01_select_where_holdout.py
+    perf_tests: tests/perf/test_01_select_where_perf.py
 
   - id: order_limit
     spec: stages/02_order_limit.md
     type: feature_addition
     training_tests: tests/training/test_02_order_limit.py
     holdout_tests: tests/holdout/test_02_order_limit_holdout.py
+    perf_tests: tests/perf/test_02_order_limit_perf.py
     parallelizable_with: [aggregation]
 
   - id: aggregation
@@ -31,6 +33,7 @@ stages:
     type: feature_addition
     training_tests: tests/training/test_03_aggregation.py
     holdout_tests: tests/holdout/test_03_aggregation_holdout.py
+    perf_tests: tests/perf/test_03_aggregation_perf.py
     parallelizable_with: [order_limit]
 
   - id: join
@@ -38,12 +41,14 @@ stages:
     type: feature_addition
     training_tests: tests/training/test_04_join.py
     holdout_tests: tests/holdout/test_04_join_holdout.py
+    perf_tests: tests/perf/test_04_join_perf.py
 
   - id: list_ops
     spec: stages/05_list_ops.md
     type: feature_addition
     training_tests: tests/training/test_05_list_ops.py
     holdout_tests: tests/holdout/test_05_list_ops_holdout.py
+    perf_tests: tests/perf/test_05_list_ops_perf.py
     parallelizable_with: [join]
 
   - id: coercion_rules
@@ -52,6 +57,7 @@ stages:
     pipeline_tags: [implicit-invalidation]
     training_tests: tests/training/test_06_coercion.py
     holdout_tests: tests/holdout/test_06_coercion_holdout.py
+    perf_tests: tests/perf/test_06_coercion_perf.py
 
 pipelines:
   sequential_full:
@@ -74,6 +80,7 @@ pipelines:
       - select_where
       - parallel: [order_limit, aggregation]
     differential: parallel
+    pipeline_tags: [parallel-merge]
 
   parallel_join_list:
     stages:
@@ -81,6 +88,7 @@ pipelines:
       - order_limit
       - parallel: [join, list_ops]
     differential: parallel
+    pipeline_tags: [parallel-merge]
 
   roundtrip_translation:
     stages:
@@ -118,3 +126,4 @@ pipelines:
     compare:
       before: order_limit
       after: remove_select
+    pipeline_tags: [feature-churn]

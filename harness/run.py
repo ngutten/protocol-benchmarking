@@ -116,8 +116,8 @@ def main():
     parser.add_argument("--pipeline", help="Pipeline to execute from task.yaml")
     parser.add_argument("--slots", help="Protocol slot assignments (e.g. A=proto1,B=proto2)")
     parser.add_argument("--fork-from", help="Fork from existing tree node ID (skip completed stages)")
-    parser.add_argument("--work-dir", help="Working directory (default: auto-created under runs/)")
-    parser.add_argument("--log-dir", help="Directory for log output (default: auto-created under runs/)")
+    parser.add_argument("--work-dir", help="Working directory (default: auto-created under runs/<task>/)")
+    parser.add_argument("--log-dir", help="Directory for log output (default: auto-created under runs/<task>/)")
     parser.add_argument("--engine-cmd", default="python3 minidb.py", help="Command to start the engine")
     parser.add_argument("--stages", nargs="*", help="Specific stages to run (default: all)")
     parser.add_argument("--mode", choices=["headless", "interactive", "manual"],
@@ -142,10 +142,8 @@ def main():
         list_pipelines(args.task_dir)
         return
 
-    # Web UI mode — protocol is optional (can be selected in browser)
+    # Web UI mode — both task-dir and protocol are optional (can be selected in browser)
     if args.ui:
-        if not args.task_dir:
-            parser.error("--task-dir is required (or use --list-protocols)")
         from harness.web_ui import launch_ui
         launch_ui(
             task_dir=args.task_dir,

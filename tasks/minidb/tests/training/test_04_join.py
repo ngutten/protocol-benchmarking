@@ -11,12 +11,9 @@ class TestBasicJoin:
         rows = engine.query_rows(
             "SELECT users.name, orders.product FROM users JOIN orders ON users.id = orders.user_id ORDER BY orders.product"
         )
-        assert rows == [["alice", "gadget"], ["alice", "gizmo"], ["bob", "widget"]]
-        # Wait, that's wrong. Let me fix: alice has widget and gizmo, bob has gadget
-        # Actually: (1,'widget'), (2,'gadget'), (1,'gizmo')
         # alice(1)->widget, alice(1)->gizmo, bob(2)->gadget
         # sorted by product: gadget, gizmo, widget
-        # So: bob-gadget, alice-gizmo, alice-widget
+        assert rows == [["bob", "gadget"], ["alice", "gizmo"], ["alice", "widget"]]
 
     def test_inner_join_corrected(self, engine):
         engine.execute("CREATE TABLE users (id, name)")
@@ -45,9 +42,9 @@ class TestBasicJoin:
         cols, rows = engine.query(
             "SELECT * FROM t1 JOIN t2 ON t1.a = t2.a"
         )
-        # Duplicate 'a' columns should be prefixed
+        # Duplicate 'a' columns should be prefixed: t1.a, b, t2.a, c
         assert "t1.a" in cols or "a" in cols
-        assert len(cols) == 3  # t1.a, b, c (or t1.a, t2.a, b, c if both included)
+        assert len(cols) == 4
 
 
 class TestJoinWithTypes:
