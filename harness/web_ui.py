@@ -27,9 +27,14 @@ from .metrics import collect_stage_metrics
 from .protocols import ALL_PROTOCOLS
 from .state_tree import StateTree, TreeNode
 from .token_usage import get_session_token_usage
+from concurrent.futures import ThreadPoolExecutor
 
 
 app = FastAPI()
+
+# Dedicated thread pool for PTY blocking reads — keeps them from exhausting
+# the default asyncio executor (which is small on low-core machines).
+_pty_executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="pty-io")
 
 # ---------------------------------------------------------------------------
 # Per-session state
@@ -456,23 +461,19 @@ async def _monitor_pty_exit(session: RunSession):
         return
 
     _harness_log(f"monitor: watching PID {child_pid}", session)
-    loop = asyncio.get_event_loop()
 
-    def _wait_for_exit():
-        """Block until child process exits."""
+    try:
         while True:
             try:
                 pid, exit_status = os.waitpid(child_pid, os.WNOHANG)
                 if pid != 0:
                     _harness_log(f"monitor: PID {child_pid} exited (status={exit_status})", session)
-                    return exit_status
+                    break
             except ChildProcessError:
                 _harness_log(f"monitor: PID {child_pid} already reaped", session)
-                return 0
-            time.sleep(0.25)
-
-    try:
-        await loop.run_in_executor(None, _wait_for_exit)
+                exit_status = 0
+                break
+            await asyncio.sleep(0.25)
     except asyncio.CancelledError:
         _harness_log("monitor: cancelled", session)
         return
@@ -521,20 +522,27 @@ async def _auto_complete_stage(session: RunSession):
             pass
         session.pty_fd = None
 
+    # Run blocking I/O in executor to avoid stalling the event loop
+    loop = asyncio.get_event_loop()
+
     # Find claude session ID from recent JSONL files
-    claude_session_id = _find_latest_session_id(str(exp.work_dir))
+    claude_session_id = await loop.run_in_executor(
+        _pty_executor, _find_latest_session_id, str(exp.work_dir))
 
     # Get token usage
     token_data = None
     if claude_session_id:
-        usage = get_session_token_usage(claude_session_id)
+        usage = await loop.run_in_executor(
+            _pty_executor, get_session_token_usage, claude_session_id)
         if usage["total_tokens"] > 0:
             token_data = usage
 
-    # Complete stage via experiment
+    # Complete stage via experiment (runs tests — can be slow)
     _harness_log(f"auto_complete: running metrics for {stage_id} (claude_session={claude_session_id}, tokens={token_data.get('total_tokens', 0) if token_data else 0})", session)
     try:
-        metrics = exp.complete_stage(stage_id, human_time=human_time, wall_time=wall_time, token_data=token_data)
+        metrics = await loop.run_in_executor(
+            _pty_executor,
+            lambda: exp.complete_stage(stage_id, human_time=human_time, wall_time=wall_time, token_data=token_data))
         metrics_dict = metrics.to_dict()
     except Exception as e:
         _harness_log(f"auto_complete: ERROR in complete_stage: {e}", session)
@@ -548,8 +556,8 @@ async def _auto_complete_stage(session: RunSession):
     _harness_log(f"auto_complete: done for {stage_id} (train={metrics_dict.get('training_tests_passed')}/{metrics_dict.get('training_tests_total')})", session)
 
     # Auto-save log and consolidate
-    exp.save_log()
-    _consolidate_log(exp)
+    await loop.run_in_executor(_pty_executor, exp.save_log)
+    await loop.run_in_executor(_pty_executor, _consolidate_log, exp)
 
 
 async def _auto_start_next_stage(session: RunSession):
@@ -825,13 +833,16 @@ async def get_state(session_id: str = None):
     if session.current_stage_idx >= 0 and session.stage_start_time:
         wall_elapsed = time.time() - session.stage_start_time
         human_time = _compute_human_time(session)
-        # Try to get live token count
+        # Try to get live token count (run in executor to avoid blocking event loop)
         live_tokens = 0
         if exp:
-            claude_session_id = _find_latest_session_id(str(exp.work_dir))
+            loop = asyncio.get_event_loop()
+            claude_session_id = await loop.run_in_executor(
+                _pty_executor, _find_latest_session_id, str(exp.work_dir))
             if claude_session_id:
                 try:
-                    usage = get_session_token_usage(claude_session_id)
+                    usage = await loop.run_in_executor(
+                        _pty_executor, get_session_token_usage, claude_session_id)
                     live_tokens = usage.get("total_tokens", 0)
                 except Exception:
                     pass
@@ -960,26 +971,33 @@ async def complete_stage(request: FastAPIRequest):
     # Kill PTY
     _kill_pty(session)
 
+    # Run blocking I/O in executor to avoid stalling the event loop
+    loop = asyncio.get_event_loop()
+
     # Find claude session ID from recent JSONL files
-    claude_session_id = _find_latest_session_id(str(exp.work_dir))
+    claude_session_id = await loop.run_in_executor(
+        _pty_executor, _find_latest_session_id, str(exp.work_dir))
 
     # Get token usage
     token_data = None
     if claude_session_id:
-        usage = get_session_token_usage(claude_session_id)
+        usage = await loop.run_in_executor(
+            _pty_executor, get_session_token_usage, claude_session_id)
         if usage["total_tokens"] > 0:
             token_data = usage
 
-    # Complete stage via experiment
-    metrics = exp.complete_stage(stage_id, human_time=human_time, wall_time=wall_time, token_data=token_data)
+    # Complete stage via experiment (runs tests — can be slow)
+    metrics = await loop.run_in_executor(
+        _pty_executor,
+        lambda: exp.complete_stage(stage_id, human_time=human_time, wall_time=wall_time, token_data=token_data))
     metrics_dict = metrics.to_dict()
 
     session.stage_metrics.append(metrics_dict)
     session.current_stage_idx = -1
 
     # Auto-save log and consolidate
-    exp.save_log()
-    _consolidate_log(exp)
+    await loop.run_in_executor(_pty_executor, exp.save_log)
+    await loop.run_in_executor(_pty_executor, _consolidate_log, exp)
 
     return {"stage_id": stage_id, "metrics": metrics_dict}
 
@@ -1218,7 +1236,7 @@ async def terminal_ws(ws: WebSocket, session_id: str):
                     continue
 
                 try:
-                    data = await loop.run_in_executor(None, _blocking_read_pty, current_fd)
+                    data = await loop.run_in_executor(_pty_executor, _blocking_read_pty, current_fd)
                     if data is None:
                         # EOF — fd is dead. Wait for a replacement.
                         new_fd, new_gen = await _wait_for_new_pty(session, current_gen)
@@ -1363,13 +1381,13 @@ def _load_all_tasks():
 
 
 @app.get("/api/logs")
-async def get_logs():
+def get_logs():
     """Return all experiment logs with metrics (stripped of test_results)."""
     return {"runs": _load_all_logs()}
 
 
 @app.get("/api/tasks")
-async def get_tasks():
+def get_tasks():
     """Return all task configurations with stage metadata."""
     return {"tasks": _load_all_tasks()}
 
@@ -1397,8 +1415,9 @@ async def analyze_differential(request: FastAPIRequest):
     baseline_proto = body.get("baseline", "")
     metric_names = body.get("metrics", ["holdout_accuracy"])
 
-    # Load task config to get stage IDs
-    tasks = _load_all_tasks()
+    # Load task config and logs in executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    tasks = await loop.run_in_executor(_pty_executor, _load_all_tasks)
     task_cfg = tasks.get(task_path)
     if not task_cfg:
         return {"error": f"Task not found: {task_path}"}
@@ -1419,7 +1438,7 @@ async def analyze_differential(request: FastAPIRequest):
         return {"error": "Both groups A and B must have at least one stage"}
 
     # Load logs and filter to this task
-    logs = _load_all_logs()
+    logs = await loop.run_in_executor(_pty_executor, _load_all_logs)
     task_logs = [l for l in logs if l.get("task", "").rstrip("/").endswith(task_path.split("/")[-1])]
 
     # For each log, determine per-stage protocol mapping
