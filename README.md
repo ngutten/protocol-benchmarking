@@ -1,7 +1,29 @@
-# MiniDB Benchmark Suite
+# Benchmarking Protocols
 
-See the code and task specs for full documentation.
+This repo centers around benchmarking different protocols for AI-assisted code development (in this case, focusing on Claude Code CLI). The idea is not to compare different models, but for a fixed model to compare different ways of working with it.
 
-Usage:
-  python3 harness/run.py --task-dir tasks/minidb --protocol direct_tests_provided --work-dir /tmp/workspace --log-dir logs/
-  python3 analysis/analyze.py --log-dir logs/ --baseline direct_tests_provided --plots plots/
+`python harness/run.py --ui` provides a web interface for running tasks and analyzing results.
+
+We measure a variety of metrics:
+
+- **Wall clock time**: How long it takes to develop
+- **Effective tokens**: Estimate of tokens used to develop, weighted roughly by API costs (so cache reads are ~10x cheaper than cache writes)
+- **Lines of Code**: How large the resulting programs are
+- **Performance**: Each task includes some speed tests
+- **Regressions**: How many things break between stages
+- **Training vs Holdout accuracy**: We hide some unit tests from the LLM and can compare pass rates for exposed tests vs hidden ones
+- **Task failure rate**: Sometimes the LLM itself will just fail to complete a task - these cases are separated out
+
+We currently have four tasks and are adding more:
+
+- **plotcurve**: A quick minimal task to make a curve plotter first for a quick function, then in the second stage to parse LaTeX expressions and plot the corresponding curve. Mostly here to test the harness.
+- **minidb**: A task implementing a schema-free database in Python in six stages. The later stages are designed to invalidate assumptions implicit in previous stages, to test refactoring.
+- **cellautomata**: A task to make a Conway's Game of Life simulator with a UI using PySide6, and then extend it to other CAs. Strongly sensitive to code optimization choices.
+- **maze**: A task to make a web-based maze exploration game, tests UI and web development, as well as behavior when things are underspecified (the specific web technology is not specified, the maze procedural generation algorithm is not specified)
+
+The tasks have a variety of requirements, so be aware:
+
+- Web UI tasks require playwright to be installed (pip install playwright) and specifically the chromium browser (playwright install chromium)
+- Python UI tasks require PySide6 
+
+If you're seeing tasks fail with 0/N tests passed, it can be because of a missing install that Claude does not have permissions to correct.
