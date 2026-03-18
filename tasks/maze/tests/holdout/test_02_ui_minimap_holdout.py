@@ -1,8 +1,8 @@
 """
-Holdout tests for Stage 1: Maze Explorer.
+Holdout tests for Stage 2: First-Person Rendering & Minimap.
 
-More rigorous rendering, interaction, and edge-case tests that are hidden
-from the LLM during development.
+More rigorous rendering, depth, terrain visual, and minimap tests that are
+hidden from the LLM during development.
 """
 import pytest
 from ..conftest import (
@@ -183,7 +183,7 @@ class TestWaterDetails:
     """Detailed tests for water (~) cell behavior."""
 
     def test_water_visible_as_floor(self, page):
-        """Water renders as a visible surface (not a wall), but blocks movement."""
+        """Water renders as a visible surface, not pitch black like a wall face."""
         water = find_cell_of_type(page, "~")
         if water is None:
             pytest.skip("No water cells")
@@ -194,17 +194,19 @@ class TestWaterDetails:
             pytest.skip("Could not reach cell adjacent to water")
         face_direction(page, adj[2])
 
-        # Looking at water should show something visible (not completely black like walls)
+        # Looking at water should show a visible floor area (not completely black)
         dims = get_element_dimensions(page, "#game-view")
         if dims is None:
             pytest.skip("No game-view")
         w, h = int(dims["width"]), int(dims["height"])
-        center = sample_region_colors(page, "#game-view", w // 2 - 10, h // 2 - 10, 20, 20)
-        if center is None:
+        # Sample lower-center area where water floor would render
+        floor_color = sample_region_colors(page, "#game-view",
+                                           w // 2 - 15, h * 2 // 3, 30, 15)
+        if floor_color is None:
             pytest.skip("Cannot sample canvas")
-        # Water should have some color (not pitch black)
-        # This is a loose check — different implementations may vary
-        assert center is not None, "Should render something when facing water"
+        brightness = sum(floor_color) / 3
+        assert brightness > 5, \
+            f"Water should render as a visible floor surface, got brightness={brightness}: {floor_color}"
 
     def test_water_on_minimap(self, page):
         """Water cells show distinctly on the minimap (different from hallways)."""
@@ -217,69 +219,22 @@ class TestWaterDetails:
             pytest.skip("No accessible cell adjacent to water")
         navigate_to_cell(page, adj[0], adj[1])
 
-        # Verify minimap has content (basic check)
-        dims = get_element_dimensions(page, "#minimap")
-        assert dims is not None, "No minimap"
-        assert dims["width"] > 0 and dims["height"] > 0
-
-
-# ── Movement Edge Cases ───────────────────────────────────────────────────
-
-
-class TestMovementEdgeCases:
-    """Edge cases for movement mechanics."""
-
-    def test_full_rotation(self, page):
-        """Pressing A four times returns to the original direction."""
-        dir_start = get_player_direction(page)
-        for _ in range(4):
-            press_game_key(page, "a")
-        dir_end = get_player_direction(page)
-        assert dir_end == dir_start, \
-            f"4 left turns should return to {dir_start}, got {dir_end}"
-
-    def test_full_rotation_right(self, page):
-        """Pressing D four times returns to the original direction."""
-        dir_start = get_player_direction(page)
-        for _ in range(4):
-            press_game_key(page, "d")
-        dir_end = get_player_direction(page)
-        assert dir_end == dir_start, \
-            f"4 right turns should return to {dir_start}, got {dir_end}"
-
-    def test_backward_through_corridor(self, page):
-        """S key moves backward correctly through a corridor."""
-        deltas = {"N": (0, -1), "E": (1, 0), "S": (0, 1), "W": (-1, 0)}
-        pos_start = get_player_position(page)
-
-        # Find open direction and move forward twice
-        for _ in range(4):
-            d = get_player_direction(page)
-            dx, dy = deltas[d]
-            cell = get_maze_cell(page, pos_start[0] + dx, pos_start[1] + dy)
-            if cell not in ("#", "~"):
-                break
-            press_game_key(page, "d")
-
-        press_game_key(page, "w")
-        pos1 = get_player_position(page)
-        if pos1 == pos_start:
-            pytest.skip("Cannot move forward")
-
-        # Now backward
-        press_game_key(page, "s")
-        pos2 = get_player_position(page)
-        assert pos2 == pos_start, f"Backward should return to {pos_start}, got {pos2}"
-
-    def test_movement_updates_visited_cells(self, page):
-        """Each move adds newly revealed cells to visited list."""
-        visited_before = len(page.evaluate("() => window.game.getVisitedCells()"))
-        # Move around
-        for key in ["w", "d", "w", "w"]:
-            press_game_key(page, key)
-        visited_after = len(page.evaluate("() => window.game.getVisitedCells()"))
-        assert visited_after >= visited_before, \
-            "Visited cell count should not decrease after moving"
+        # Verify minimap has non-blank rendered content
+        has_content = page.evaluate("""(sel) => {
+            const el = document.querySelector(sel);
+            if (!el) return false;
+            const canvas = el.tagName === 'CANVAS' ? el : el.querySelector('canvas');
+            if (canvas) {
+                const ctx = canvas.getContext('2d');
+                const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                for (let i = 0; i < data.length; i += 4) {
+                    if (data[i] > 10 || data[i+1] > 10 || data[i+2] > 10) return true;
+                }
+                return false;
+            }
+            return el.children.length > 0 || el.innerHTML.trim().length > 0;
+        }""", "#minimap")
+        assert has_content, "Minimap should have visible content after navigating near water"
 
 
 # ── Rendering Changes ─────────────────────────────────────────────────────

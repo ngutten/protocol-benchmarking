@@ -25,7 +25,9 @@ We currently have four tasks and are adding more:
 
 ## Setup
 
-Install all dependencies:
+Install the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) and ensure it is authenticated and available on your PATH.
+
+Install Python dependencies:
 
 ```bash
 pip install -r requirements.txt

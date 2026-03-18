@@ -1,7 +1,7 @@
 """
-Training tests for Stage 2: Procedural Maze Generation & Textures.
+Training tests for Stage 3: Edge Walls, Doors & Procedural Maze Generation.
 
-Tests maze generation, edge walls, doors, textures, and updated minimap.
+Tests maze generation, edge-based wall representation, and door mechanics.
 """
 import pytest
 from ..conftest import (
@@ -90,12 +90,11 @@ class TestEdgeWalls:
             assert walls[edge] in ("wall", "door", "open"), \
                 f"Invalid wall type for {edge}: {walls[edge]}"
 
-    def test_edge_wall_renders(self, page):
-        """A wall between two open cells renders visually."""
+    def test_generated_maze_has_edge_walls(self, page):
+        """Generated maze contains at least one cell with a 'wall' edge."""
         page.evaluate("() => window.game.regenerateMaze(10, 10)")
         page.wait_for_timeout(500)
 
-        # Find a cell with a wall edge
         state = get_game_state(page)
         w, h = state["mazeWidth"], state["mazeHeight"]
         found = False
@@ -209,84 +208,14 @@ class TestDoors:
                     f"Door and wall should look different: {door_color} vs {wall_color}"
 
 
-# ── Textures ──────────────────────────────────────────────────────────────
+# ── Minimap Stage 3 ──────────────────────────────────────────────────────
 
 
-class TestTextures:
-    """Verify texture application to surfaces."""
-
-    def test_textures_applied(self, page):
-        """Surfaces show textured content (not flat solid colors)."""
-        page.evaluate("() => window.game.regenerateMaze(10, 10)")
-        page.wait_for_timeout(500)
-
-        dims = get_element_dimensions(page, "#game-view")
-        if dims is None:
-            pytest.skip("No game-view")
-        w, h = int(dims["width"]), int(dims["height"])
-
-        # Sample two adjacent small regions on a wall — textures should have variation
-        color1 = sample_region_colors(page, "#game-view", 10, h // 2, 5, 5)
-        color2 = sample_region_colors(page, "#game-view", 30, h // 2, 5, 5)
-        if color1 is None or color2 is None:
-            pytest.skip("Cannot sample canvas")
-
-        # With textures, adjacent small regions usually differ
-        # This is a weak check — flat shading might pass too
-        assert color1 is not None and color2 is not None
-
-    def test_cell_textures_api(self, page):
-        """getCellTextures() returns floor and ceiling texture names."""
-        page.evaluate("() => window.game.regenerateMaze(10, 10)")
-        page.wait_for_timeout(500)
-        pos = get_player_position(page)
-        textures = page.evaluate(
-            "([x, y]) => window.game.getCellTextures(x, y)", [pos[0], pos[1]]
-        )
-        assert textures is not None, "getCellTextures() returned null"
-        assert "floor" in textures, "Missing 'floor' in textures"
-        assert "ceiling" in textures, "Missing 'ceiling' in textures"
-        assert isinstance(textures["floor"], str) and len(textures["floor"]) > 0
-        assert isinstance(textures["ceiling"], str) and len(textures["ceiling"]) > 0
-
-    def test_different_areas_different_textures(self, page):
-        """Two areas with different assigned textures render differently."""
-        page.evaluate("() => window.game.regenerateMaze(20, 20)")
-        page.wait_for_timeout(500)
-
-        state = get_game_state(page)
-        w, h = state["mazeWidth"], state["mazeHeight"]
-
-        # Find two cells with different floor textures
-        textures_seen = {}
-        for y in range(h):
-            for x in range(w):
-                cell = get_maze_cell(page, x, y)
-                if cell in ("#", "~"):
-                    continue
-                tex = page.evaluate(
-                    "([x, y]) => window.game.getCellTextures(x, y)", [x, y]
-                )
-                if tex and tex["floor"]:
-                    key = tex["floor"]
-                    if key not in textures_seen:
-                        textures_seen[key] = (x, y)
-                    if len(textures_seen) >= 2:
-                        break
-            if len(textures_seen) >= 2:
-                break
-
-        assert len(textures_seen) >= 2, "Expected at least 2 different floor textures"
-
-
-# ── Minimap Stage 2 ──────────────────────────────────────────────────────
-
-
-class TestMinimapStage2:
-    """Verify minimap updates for stage 2 features."""
+class TestMinimapStage3:
+    """Verify minimap updates for stage 3 features."""
 
     def test_minimap_shows_doors(self, page):
-        """Doors are visible on the minimap differently from walls."""
+        """Minimap renders visible content after exploring a generated maze with doors."""
         page.evaluate("() => window.game.regenerateMaze(15, 15)")
         page.wait_for_timeout(500)
 
@@ -296,7 +225,20 @@ class TestMinimapStage2:
             if get_player_position(page) == get_player_position(page):
                 press_game_key(page, "d")
 
-        # Basic check: minimap has content
-        dims = get_element_dimensions(page, "#minimap")
-        assert dims is not None, "No minimap"
-        assert dims["width"] > 0 and dims["height"] > 0
+        # Verify minimap has non-blank rendered content
+        has_content = page.evaluate("""(sel) => {
+            const el = document.querySelector(sel);
+            if (!el) return false;
+            const canvas = el.tagName === 'CANVAS' ? el : el.querySelector('canvas');
+            if (canvas) {
+                const ctx = canvas.getContext('2d');
+                const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                let nonBlank = 0;
+                for (let i = 0; i < data.length; i += 4) {
+                    if (data[i] > 10 || data[i+1] > 10 || data[i+2] > 10) nonBlank++;
+                }
+                return nonBlank > 20;
+            }
+            return el.children.length > 0 || el.innerHTML.trim().length > 0;
+        }""", "#minimap")
+        assert has_content, "Minimap should have visible content after exploring generated maze"

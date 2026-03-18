@@ -14,27 +14,43 @@ domain_tags:
   - simulation
 
 stages:
-  - id: maze_explorer
-    spec: stages/01_maze_explorer.md
+  - id: dungeon_logic
+    spec: stages/01_dungeon_logic.md
     type: feature_addition
-    training_tests: tests/training/test_01_maze_explorer.py
-    holdout_tests: tests/holdout/test_01_maze_explorer_holdout.py
-    perf_tests: tests/perf/test_01_maze_explorer_perf.py
+    training_tests: tests/training/test_01_dungeon_logic.py
+    holdout_tests: tests/holdout/test_01_dungeon_logic_holdout.py
+    perf_tests: tests/perf/test_01_dungeon_logic_perf.py
 
-  - id: procedural_maze
-    spec: stages/02_procedural_maze.md
+  - id: ui_minimap
+    spec: stages/02_ui_minimap.md
     type: feature_addition
-    training_tests: tests/training/test_02_procedural_maze.py
-    holdout_tests: tests/holdout/test_02_procedural_maze_holdout.py
-    perf_tests: tests/perf/test_02_procedural_maze_perf.py
+    training_tests: tests/training/test_02_ui_minimap.py
+    holdout_tests: tests/holdout/test_02_ui_minimap_holdout.py
+    perf_tests: tests/perf/test_02_ui_minimap_perf.py
+
+  - id: procedural_generation
+    spec: stages/03_procedural_generation.md
+    type: feature_addition
+    training_tests: tests/training/test_03_procedural_generation.py
+    holdout_tests: tests/holdout/test_03_procedural_generation_holdout.py
+    perf_tests: tests/perf/test_03_procedural_generation_perf.py
+
+  - id: texture_mapping
+    spec: stages/04_texture_mapping.md
+    type: feature_addition
+    training_tests: tests/training/test_04_texture_mapping.py
+    holdout_tests: tests/holdout/test_04_texture_mapping_holdout.py
+    perf_tests: tests/perf/test_04_texture_mapping_perf.py
 
 pipelines:
   sequential_full:
-    stages: [maze_explorer, procedural_maze]
+    stages: [dungeon_logic, ui_minimap, procedural_generation, texture_mapping]
     differential: sequential
 
   sequential_diff_ab:
     stages:
-      - {stage: maze_explorer, slot: A}
-      - {stage: procedural_maze, slot: B}
+      - {stage: dungeon_logic, slot: A}
+      - {stage: ui_minimap, slot: A}
+      - {stage: procedural_generation, slot: B}
+      - {stage: texture_mapping, slot: B}
     differential: sequential
