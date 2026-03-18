@@ -1,0 +1,40 @@
+name: maze
+title: "Maze Explorer: First-Person Web Maze Game"
+description: >
+  Web-based first-person maze exploration game with grid-based movement,
+  3D rendering, minimap, special terrain, and procedural maze generation.
+  Tests exercise rendering, interactivity, and usability via Playwright.
+
+engine_cmd: "python3 -m http.server 8000"
+
+domain_tags:
+  - visualization
+  - gui
+  - stateful
+  - simulation
+
+stages:
+  - id: maze_explorer
+    spec: stages/01_maze_explorer.md
+    type: feature_addition
+    training_tests: tests/training/test_01_maze_explorer.py
+    holdout_tests: tests/holdout/test_01_maze_explorer_holdout.py
+    perf_tests: tests/perf/test_01_maze_explorer_perf.py
+
+  - id: procedural_maze
+    spec: stages/02_procedural_maze.md
+    type: feature_addition
+    training_tests: tests/training/test_02_procedural_maze.py
+    holdout_tests: tests/holdout/test_02_procedural_maze_holdout.py
+    perf_tests: tests/perf/test_02_procedural_maze_perf.py
+
+pipelines:
+  sequential_full:
+    stages: [maze_explorer, procedural_maze]
+    differential: sequential
+
+  sequential_diff_ab:
+    stages:
+      - {stage: maze_explorer, slot: A}
+      - {stage: procedural_maze, slot: B}
+    differential: sequential

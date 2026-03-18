@@ -1,0 +1,63 @@
+name: cellautomata
+title: "CellAutomata: Cellular Automaton Simulator"
+description: >
+  PySide6 GUI application and Python library for cellular automaton simulation.
+  Supports Conway's Game of Life, Falling Sand, and Langton's Ant.
+  Tests exercise both library API (direct import) and GUI (pytest-qt).
+
+engine_cmd: "python3 cellautomata.py"
+
+domain_tags:
+  - simulation
+  - gui
+  - numerical
+  - stateful
+
+stages:
+  - id: conway
+    spec: stages/01_conway.md
+    type: feature_addition
+    training_tests: tests/training/test_01_conway.py
+    holdout_tests: tests/holdout/test_01_conway_holdout.py
+    perf_tests: tests/perf/test_01_conway_perf.py
+
+  - id: multi_model
+    spec: stages/02_multi_model.md
+    type: feature_addition
+    training_tests: tests/training/test_02_multi_model.py
+    holdout_tests: tests/holdout/test_02_multi_model_holdout.py
+    perf_tests: tests/perf/test_02_multi_model_perf.py
+
+pipelines:
+  sequential_full:
+    stages: [conway, multi_model]
+    differential: sequential
+
+  sequential_diff_ab:
+    stages:
+      - {stage: conway, slot: A}
+      - {stage: multi_model, slot: B}
+    differential: sequential
+
+  roundtrip_translation:
+    stages:
+      - conway
+      - {translate: {target: "c++"}, id: translate_cpp}
+      - {translate: {target: "python"}, id: translate_back}
+    differential: round_trip
+    compare:
+      before: conway
+      after: translate_back
+    pipeline_tags: [round-trip]
+
+  roundtrip_refactor:
+    stages:
+      - conway
+      - multi_model
+      - {refactor: {target: "split simulation logic and GUI into separate modules"}, id: refactor_split}
+      - {refactor: {target: "merge back into single module"}, id: refactor_merge}
+    differential: round_trip
+    compare:
+      before: multi_model
+      after: refactor_merge
+    pipeline_tags: [round-trip, refactor-then-extend]

@@ -1,4 +1,4 @@
-"""Token usage parsing from Claude Code JSON output and session JSONL files."""
+"""Token usage and session analysis from Claude Code JSON output and session JSONL files."""
 import json
 import os
 import re
@@ -99,3 +99,104 @@ def get_session_token_usage(session_id: str, project_dir: str = None) -> dict:
 
     usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
     return usage
+
+
+# Patterns that indicate a permission/security denial (not a normal runtime error)
+_DENIAL_PATTERNS = [
+    re.compile(r"This command requires approval"),
+    re.compile(r"Permission to use \S+ has been denied"),
+    re.compile(r"Permission for this tool use was denied"),
+    re.compile(r"Output redirection to .+ was blocked"),
+    re.compile(r"Command contains .+"),  # security blocks (substitution, bypass, etc.)
+    re.compile(r"This Bash command contains multiple operations"),
+]
+
+
+def _is_permission_denial(error_text: str) -> bool:
+    """Check if a tool_result error looks like a permission/security denial."""
+    for pat in _DENIAL_PATTERNS:
+        if pat.search(error_text):
+            return True
+    return False
+
+
+def _find_session_file(session_id: str) -> Path | None:
+    """Locate a session JSONL file by session ID."""
+    if not session_id:
+        return None
+    claude_dir = Path.home() / ".claude" / "projects"
+    if not claude_dir.exists():
+        return None
+    for dirpath, _, filenames in os.walk(claude_dir):
+        for fname in filenames:
+            if fname == f"{session_id}.jsonl":
+                return Path(dirpath) / fname
+    return None
+
+
+def get_denied_tool_calls(session_id: str) -> list:
+    """Parse a session JSONL for tool calls that were denied by permissions.
+
+    Returns a list of dicts, each with:
+        tool: str       — tool name that was attempted (e.g. "Bash", "WebSearch")
+        input_summary: str — abbreviated input (command or first 120 chars)
+        error: str      — the denial message (first 200 chars)
+    """
+    session_file = _find_session_file(session_id)
+    if not session_file or not session_file.exists():
+        return []
+
+    # Two-pass: first collect all tool_use blocks by ID, then match denials
+    tool_uses = {}  # tool_use_id -> {tool, input_summary}
+    denied = []
+
+    with open(session_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            content = (
+                msg.get("message", {}).get("content")
+                if isinstance(msg.get("message"), dict)
+                else msg.get("content")
+            )
+            if not isinstance(content, list):
+                continue
+
+            for block in content:
+                btype = block.get("type")
+
+                if btype == "tool_use":
+                    tool_id = block.get("id", "")
+                    tool_name = block.get("name", "unknown")
+                    inp = block.get("input", {})
+                    if isinstance(inp, dict):
+                        summary = inp.get("command", inp.get("query",
+                                  inp.get("url", str(inp))))
+                    else:
+                        summary = str(inp)
+                    tool_uses[tool_id] = {
+                        "tool": tool_name,
+                        "input_summary": str(summary)[:120],
+                    }
+
+                elif btype == "tool_result" and block.get("is_error"):
+                    error_text = str(block.get("content", ""))
+                    if _is_permission_denial(error_text):
+                        tool_id = block.get("tool_use_id", "")
+                        tool_info = tool_uses.get(tool_id, {
+                            "tool": "unknown",
+                            "input_summary": "",
+                        })
+                        denied.append({
+                            "tool": tool_info["tool"],
+                            "input_summary": tool_info["input_summary"],
+                            "error": error_text[:200],
+                        })
+
+    return denied

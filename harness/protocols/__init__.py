@@ -109,6 +109,27 @@ WEB_ACCESS_TOOLS = [
 
 
 # ---------------------------------------------------------------------------
+# PhaseDef dataclass — one step in a multi-phase protocol
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PhaseDef:
+    """Defines a single phase in a multi-phase protocol pipeline.
+
+    Each phase becomes a fresh ``claude -p`` invocation.  Inter-phase
+    communication happens via workspace files (PLAN.md, REVIEW.md, etc.)
+    rather than prompt injection.
+    """
+    name: str                              # "plan", "implement", "review", "fix"
+    prompt_template: str                   # May contain {prev_result}, {phase_plan}, {prompt}
+    permission_mode: str = "acceptEdits"   # "plan" or "acceptEdits"
+    model: Optional[str] = None            # Override protocol-level model for this phase
+    timeout: Optional[int] = None          # Override timeout for this phase
+    parallel_prompts: Optional[list] = None  # If set, run these concurrently instead of prompt_template
+    pass_result: bool = True               # Make result available to later phases
+
+
+# ---------------------------------------------------------------------------
 # ProtocolDef dataclass
 # ---------------------------------------------------------------------------
 
@@ -145,6 +166,8 @@ class ProtocolDef:
     # The placeholder {prompt} in any element will be replaced with the
     # stage prompt, and {work_dir} with the workspace path.
     custom_command: Optional[list] = None
+    # Multi-phase protocol: list[PhaseDef].  When set, overrides planning_phase logic.
+    phases: Optional[list] = None
 
     def get_allowed_tools(self) -> list:
         """Build the full list of --allowedTools for this protocol."""

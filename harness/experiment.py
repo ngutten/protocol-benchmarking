@@ -15,7 +15,10 @@ import shutil
 import yaml
 from datetime import datetime
 from pathlib import Path
-from .metrics import collect_stage_metrics, detect_merge_conflicts, StageMetrics
+from .metrics import (
+    collect_stage_metrics, detect_merge_conflicts, detect_spontaneous_behaviors,
+    StageMetrics,
+)
 from .git_manager import GitManager
 from .protocols import ALL_PROTOCOLS, ProtocolDef
 from .stage_types import (
@@ -67,10 +70,16 @@ def generate_claude_md(stage_id: str, protocol: ProtocolDef, has_full_spec: bool
     if protocol.provides_training_tests:
         lines.append("- Tests are in the `tests/` directory. Run them with `python3 -m pytest tests/ -v`.")
         lines.append("")
+    else:
+        lines.append("- `tests/conftest.py` contains the test harness client that will be used to evaluate your implementation. Read it to understand the exact interface your engine must satisfy.")
+        lines.append("")
 
     lines.append("## Constraints")
     lines.append("- Work only on files in the current directory.")
-    lines.append("- Do not create or modify test files unless you are writing your own tests.")
+    if protocol.llm_writes_tests:
+        lines.append("- You may create and modify test files in the tests/ directory.")
+    else:
+        lines.append("- Do not create or modify test files.")
     if special_stage:
         lines.append(f"- Focus on the {special_stage['type']} operation described in the prompt.")
     else:
@@ -310,6 +319,34 @@ class Experiment:
             return result
         return list(self.stages)
 
+    def _write_workspace_settings(self):
+        """Create .claude/settings.local.json in the workspace.
+
+        Converts the protocol's --allowedTools patterns (e.g. ``Bash(python3 *)``)
+        to the settings.json format (``Bash(python3:*)``) so interactive sessions
+        auto-permit the same tools that headless mode uses.
+        """
+        allowed = []
+        for tool in self.protocol.get_allowed_tools():
+            # Non-Bash tools (Read, Edit, etc.) pass through as-is
+            if not tool.startswith("Bash("):
+                allowed.append(tool)
+                continue
+            # Convert Bash(cmd *) -> Bash(cmd:*) and Bash(cmd) -> Bash(cmd)
+            inner = tool[5:-1]  # strip "Bash(" and ")"
+            parts = inner.split(" ", 1)
+            if len(parts) == 2:
+                allowed.append(f"Bash({parts[0]}:{parts[1]})")
+            else:
+                allowed.append(tool)
+
+        claude_dir = self.work_dir / ".claude"
+        claude_dir.mkdir(exist_ok=True)
+        settings = {"permissions": {"allow": allowed}}
+        (claude_dir / "settings.local.json").write_text(
+            json.dumps(settings, indent=2) + "\n"
+        )
+
     def setup(self, fork_from_node=None):
         """Initialize workspace and git repo.
 
@@ -319,6 +356,10 @@ class Experiment:
         """
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write .claude/settings.local.json so interactive sessions
+        # auto-permit the same tools that headless mode uses via --allowedTools.
+        self._write_workspace_settings()
 
         if fork_from_node:
             self._fork_from(fork_from_node)
@@ -340,6 +381,11 @@ class Experiment:
                     for f in stages_src.iterdir():
                         if f.suffix == ".md":
                             shutil.copy2(f, stages_dest / f.name)
+
+            # Copy task assets (maze files, textures, data files, etc.)
+            assets_src = self.task_dir / "assets"
+            if assets_src.is_dir():
+                shutil.copytree(assets_src, self.work_dir / "assets", dirs_exist_ok=True)
 
             self.git.commit_all("Initial: empty workspace")
 
@@ -458,15 +504,15 @@ class Experiment:
             if stage_spec.exists():
                 shutil.copy2(stage_spec, self.work_dir / "CURRENT_STAGE.md")
 
+        # Always copy conftest.py so the LLM knows the test harness interface
+        test_dest = self.work_dir / "tests"
+        test_dest.mkdir(exist_ok=True)
+        conftest = self.test_dir / "conftest.py"
+        if conftest.exists():
+            shutil.copy2(conftest, test_dest / "conftest.py")
+
         # Copy training tests if protocol provides them
         if protocol.provides_training_tests:
-            test_dest = self.work_dir / "tests"
-            test_dest.mkdir(exist_ok=True)
-            # Copy conftest
-            conftest = self.test_dir / "conftest.py"
-            if conftest.exists():
-                shutil.copy2(conftest, test_dest / "conftest.py")
-
             if special_stage and get_test_strategy(special_stage["type"]) == "exclude_target":
                 # Removal: copy all tests EXCEPT the target stage's tests
                 training_dir = self.test_dir / "training"
@@ -587,13 +633,19 @@ class Experiment:
         metrics.git_commit = commit
         metrics.git_tag = git_tag
 
-        # Apply token data
+        # Apply token data and denied tool calls
         if token_data:
             metrics.input_tokens = token_data.get("input_tokens", 0)
             metrics.output_tokens = token_data.get("output_tokens", 0)
             metrics.total_tokens = token_data.get("total_tokens", 0)
             metrics.cache_read_tokens = token_data.get("cache_read_tokens", 0)
             metrics.cache_creation_tokens = token_data.get("cache_creation_tokens", 0)
+            metrics.denied_tool_calls = token_data.get("denied_tool_calls", [])
+            metrics.phase_breakdown = token_data.get("phase_breakdown", [])
+
+        # Detect spontaneous agent behaviors
+        behaviors = detect_spontaneous_behaviors(str(self.work_dir), protocol.name)
+        metrics.spontaneous_behaviors = behaviors
 
         self.completed_stages.append(stage_id)
         self.all_metrics.append(metrics)
@@ -632,6 +684,38 @@ class Experiment:
         print(f"  Code: {metrics.code_lines} lines")
         print(f"  Human time: {metrics.human_time_seconds:.0f}s")
         print(f"  Tokens: {metrics.total_tokens} (in={metrics.input_tokens}, out={metrics.output_tokens})")
+        if metrics.phase_breakdown:
+            print(f"  Phases ({len(metrics.phase_breakdown)}):")
+            for pb in metrics.phase_breakdown:
+                err_flag = " [ERROR]" if pb.get("is_error") else ""
+                print(f"    {pb['phase_name']}: {pb['total_tokens']} tokens, "
+                      f"{pb['wall_time_seconds']:.1f}s{err_flag}")
+                if pb.get("sub_results"):
+                    for sr in pb["sub_results"]:
+                        print(f"      {sr['phase_name']}: {sr['total_tokens']} tokens, "
+                              f"{sr['wall_time_seconds']:.1f}s")
+        if metrics.spontaneous_behaviors:
+            print(f"  Spontaneous behaviors detected ({len(metrics.spontaneous_behaviors)}):")
+            for b in metrics.spontaneous_behaviors:
+                print(f"    [{b['type']}] {b['detail']}")
+                for bf in b.get("files", []):
+                    print(f"      - {bf}")
+        if metrics.denied_tool_calls:
+            # Deduplicate by (tool, error_prefix) for cleaner display
+            seen = set()
+            unique_denied = []
+            for d in metrics.denied_tool_calls:
+                key = (d["tool"], d["error"][:80])
+                if key not in seen:
+                    seen.add(key)
+                    unique_denied.append(d)
+            print(f"  Denied tool calls: {len(metrics.denied_tool_calls)} "
+                  f"({len(unique_denied)} unique)")
+            for d in unique_denied[:10]:  # cap display at 10
+                print(f"    [{d['tool']}] {d['input_summary'][:80]}")
+                print(f"      reason: {d['error'][:120]}")
+            if len(unique_denied) > 10:
+                print(f"    ... and {len(unique_denied) - 10} more")
         print(f"  Tree node: {tree_node.node_id}")
 
         return metrics

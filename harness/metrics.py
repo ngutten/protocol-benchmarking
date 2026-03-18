@@ -61,6 +61,9 @@ class StageMetrics:
     merge_conflict_files: list = field(default_factory=list)
     test_results: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    spontaneous_behaviors: list = field(default_factory=list)
+    denied_tool_calls: list = field(default_factory=list)
+    phase_breakdown: list = field(default_factory=list)  # per-phase token/timing data
     start_time: str = ""
     end_time: str = ""
 
@@ -248,6 +251,9 @@ def run_perf_tests(test_path, engine_cmd, conftest_dir=None, timeout=300):
                     # Prefer test-reported duration over pytest --durations
                     if data.get("duration_seconds"):
                         r.duration_seconds = data["duration_seconds"]
+                    elif data.get("bench_metric", "").endswith("_time_seconds"):
+                        # For time-based metrics, value IS the duration
+                        r.duration_seconds = data.get("value", 0.0)
         except json.JSONDecodeError:
             pass
 
@@ -360,3 +366,106 @@ def detect_merge_conflicts(project_dir):
             except Exception:
                 pass
     return conflicts, conflict_files
+
+
+def detect_spontaneous_behaviors(project_dir, protocol_name):
+    """Detect emergent agent behaviors that weren't prescribed by the protocol.
+
+    Scans the workspace for signs that the agent spontaneously adopted
+    development practices (test-writing, planning, documentation) beyond
+    what the protocol asked for. Returns a list of behavior dicts.
+
+    Each behavior dict has:
+        type: str       — category (e.g. "test_creation", "planning_doc")
+        detail: str     — human-readable description
+        files: list     — files that triggered the detection
+    """
+    behaviors = []
+    skip_dirs = {".git", "__pycache__", "node_modules", ".claude"}
+
+    # Protocols where test-writing is expected (not spontaneous)
+    test_expected = {"direct_self_test", "direct_tests_provided", "plan_and_implement",
+                     "human_supervised"}
+
+    all_files = []
+    for root, dirs, fnames in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in fnames:
+            rel = os.path.relpath(os.path.join(root, fname), project_dir)
+            all_files.append(rel)
+
+    # --- Test file creation ---
+    if protocol_name not in test_expected:
+        test_files = [f for f in all_files
+                      if (f.startswith("test_") or "/test_" in f or f.endswith("_test.py"))
+                      and f.endswith(".py")
+                      and "conftest.py" not in f
+                      # Ignore tests/ dir files that the harness copied (conftest)
+                      and not (f == "tests/conftest.py")]
+        if test_files:
+            behaviors.append({
+                "type": "test_creation",
+                "detail": f"Agent created {len(test_files)} test file(s) "
+                          f"despite protocol not requesting tests",
+                "files": test_files,
+            })
+
+    # --- Planning / design documents ---
+    plan_patterns = re.compile(
+        r"(plan|design|architecture|approach|strategy|todo|roadmap)",
+        re.IGNORECASE,
+    )
+    plan_files = [f for f in all_files
+                  if plan_patterns.search(f)
+                  and not f.endswith(".pyc")
+                  and f != "CLAUDE.md"
+                  and f != "CURRENT_STAGE.md"]
+    if plan_files:
+        behaviors.append({
+            "type": "planning_doc",
+            "detail": f"Agent created planning/design document(s)",
+            "files": plan_files,
+        })
+
+    # --- README creation ---
+    readme_files = [f for f in all_files
+                    if os.path.basename(f).lower().startswith("readme")]
+    if readme_files:
+        behaviors.append({
+            "type": "readme_creation",
+            "detail": "Agent created README file(s)",
+            "files": readme_files,
+        })
+
+    # --- Inline planning in source files ---
+    # Look for large block comments at the top of implementation files
+    # that suggest the agent planned before coding
+    source_exts = {".py", ".rs", ".cpp", ".cc", ".js", ".ts", ".go", ".c", ".h"}
+    for f in all_files:
+        ext = os.path.splitext(f)[1]
+        if ext not in source_exts:
+            continue
+        if f.startswith("tests/") or "conftest" in f:
+            continue
+        path = os.path.join(project_dir, f)
+        try:
+            with open(path) as fh:
+                lines = fh.readlines()
+        except Exception:
+            continue
+        # Check first 50 lines for plan-like block comments
+        header = "".join(lines[:50]).lower()
+        plan_signals = ["implementation plan", "design:", "approach:",
+                        "step 1:", "phase 1:", "architecture:",
+                        "data structures:", "## plan", "# plan"]
+        for signal in plan_signals:
+            if signal in header:
+                behaviors.append({
+                    "type": "inline_planning",
+                    "detail": f"Source file '{f}' contains plan-like header "
+                              f"(matched: '{signal}')",
+                    "files": [f],
+                })
+                break  # one match per file is enough
+
+    return behaviors

@@ -1331,6 +1331,22 @@ def _effective_tokens(stage):
             + int(stage.get("cache_read_tokens", 0) * 0.1))
 
 
+def _is_total_failure(log):
+    """A run is a total failure if any stage had tests to pass but passed zero.
+
+    Checks each stage independently — a run that passes stage 1 but completely
+    fails stage 2 (zero tests passed) is still a total failure.
+    """
+    for s in log.get("stages", []):
+        if s.get("skipped"):
+            continue
+        stage_tests = s.get("training_tests_total", 0) + s.get("holdout_tests_total", 0)
+        stage_passed = s.get("training_tests_passed", 0) + s.get("holdout_tests_passed", 0)
+        if stage_tests > 0 and stage_passed == 0:
+            return True
+    return False
+
+
 def _load_all_logs():
     """Load all experiment logs from logs/ directory (and subdirectories)."""
     logs = []
@@ -1348,6 +1364,8 @@ def _load_all_logs():
                 s.pop("test_results", None)
                 if "effective_tokens" not in s:
                     s["effective_tokens"] = _effective_tokens(s)
+            # Flag runs that passed zero tests as total failures
+            log["total_failure"] = _is_total_failure(log)
             logs.append(log)
         except (json.JSONDecodeError, KeyError):
             continue
@@ -1439,7 +1457,9 @@ async def analyze_differential(request: FastAPIRequest):
 
     # Load logs and filter to this task
     logs = await loop.run_in_executor(_pty_executor, _load_all_logs)
-    task_logs = [l for l in logs if l.get("task", "").rstrip("/").endswith(task_path.split("/")[-1])]
+    task_logs = [l for l in logs
+                 if l.get("task", "").rstrip("/").endswith(task_path.split("/")[-1])
+                 and not l.get("total_failure")]
 
     # For each log, determine per-stage protocol mapping
     def get_stage_protocol(log, stage_id):
@@ -1552,14 +1572,15 @@ async def analyze_differential(request: FastAPIRequest):
     # Compute stats
     def compute_stats(values):
         if not values:
-            return {"n": 0, "values": [], "mean": None, "std": None}
+            return {"n": 0, "values": [], "mean": None, "std": None, "se": None}
         mean = sum(values) / len(values)
         if len(values) > 1:
             variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
             std = math.sqrt(variance)
         else:
             std = 0.0
-        return {"n": len(values), "values": values, "mean": mean, "std": std}
+        se = std / math.sqrt(len(values)) if len(values) >= 1 else 0.0
+        return {"n": len(values), "values": values, "mean": mean, "std": std, "se": se}
 
     results = {}
     for m in metric_names:
@@ -1814,6 +1835,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <option value="holdout_accuracy">Holdout Accuracy</option>
         <option value="training_accuracy">Training Accuracy</option>
         <option value="regression_rate">Regression Rate</option>
+        <option value="failed_run_pct">Failed Run % (zero tests passed)</option>
         <option value="wall_time_seconds">Wall Time (s)</option>
         <option value="human_time_seconds">Human Time (s)</option>
         <option value="output_tokens">Output Tokens</option>
@@ -1935,6 +1957,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <option value="holdout_accuracy">Holdout Accuracy</option>
           <option value="training_accuracy">Training Accuracy</option>
           <option value="regression_rate">Regression Rate</option>
+          <option value="failed_run_pct">Failed Run %</option>
           <option value="wall_time_seconds">Wall Time (s)</option>
           <option value="human_time_seconds">Human Time (s)</option>
           <option value="output_tokens">Output Tokens</option>
@@ -1960,6 +1983,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <option value="holdout_accuracy" selected>Holdout Accuracy</option>
           <option value="training_accuracy">Training Accuracy</option>
           <option value="regression_rate">Regression Rate</option>
+          <option value="failed_run_pct">Failed Run %</option>
           <option value="effective_tokens">Effective Tokens</option>
           <option value="wall_time_seconds">Wall Time (s)</option>
           <option value="human_time_seconds">Human Time (s)</option>
@@ -2901,10 +2925,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return;
     }
 
+    // Count total failures before filtering
+    const allRuns = runs;
+    const failedRunCounts = {}; // protocol -> {failed, total}
+    allRuns.forEach(r => {
+      const p = r.protocol;
+      if (!failedRunCounts[p]) failedRunCounts[p] = { failed: 0, total: 0 };
+      failedRunCounts[p].total++;
+      if (r.total_failure) failedRunCounts[p].failed++;
+    });
+    const totalFailedRuns = allRuns.filter(r => r.total_failure).length;
+
+    // Handle failed_run_pct as a special cumulative-only metric
+    const isFailedRunMetric = metric === 'failed_run_pct';
+
+    // Filter out total failures from normal metrics
+    if (!isFailedRunMetric) {
+      runs = runs.filter(r => !r.total_failure);
+    }
+
     // Collect all protocols and stages
     // Include per-stage protocols (from stage_protocols map and stage-level fields)
     const protocolSet = new Set();
-    runs.forEach(r => {
+    allRuns.forEach(r => {
       protocolSet.add(r.protocol);
       const sp = r.stage_protocols || {};
       Object.values(sp).forEach(p => protocolSet.add(p));
@@ -2961,18 +3004,41 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       Object.assign(dataIndex, newDataIndex);
     }
 
-    // Compute mean and std for each cell
+    // Compute mean, std (sample standard deviation), and se (standard error) for each cell
     function stats(arr) {
-      if (!arr || arr.length === 0) return { mean: 0, std: 0, n: 0 };
+      if (!arr || arr.length === 0) return { mean: 0, std: 0, se: 0, n: 0 };
       const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
-      if (arr.length < 2) return { mean, std: 0, n: arr.length };
+      if (arr.length < 2) return { mean, std: 0, se: 0, n: arr.length };
       const variance = arr.reduce((a, b) => a + (b - mean) ** 2, 0) / (arr.length - 1);
-      return { mean, std: Math.sqrt(variance), n: arr.length };
+      const std = Math.sqrt(variance);
+      return { mean, std, se: std / Math.sqrt(arr.length), n: arr.length };
     }
 
     let labels, datasets;
 
-    if (viewMode === 'cumulative') {
+    if (isFailedRunMetric) {
+      // Special metric: failed run percentage per protocol (always cumulative)
+      labels = protocols;
+      const values = protocols.map(p => {
+        const c = failedRunCounts[p] || { failed: 0, total: 0 };
+        return c.total > 0 ? c.failed / c.total : 0;
+      });
+      datasets = [{
+        label: 'Failed Run %',
+        data: values,
+        backgroundColor: VIZ_COLORS.slice(0, protocols.length),
+        borderColor: VIZ_COLORS.slice(0, protocols.length),
+        borderWidth: 1,
+        rawValues: protocols.map(p => {
+          // Each run is a 0 or 1 observation
+          const c = failedRunCounts[p] || { failed: 0, total: 0 };
+          const obs = [];
+          for (let i = 0; i < c.failed; i++) obs.push(1);
+          for (let i = 0; i < c.total - c.failed; i++) obs.push(0);
+          return obs;
+        }),
+      }];
+    } else if (viewMode === 'cumulative') {
       // Cumulative: one bar per protocol, aggregated across stages.
       // When normalize is on, values are expressed relative to the cross-protocol
       // stage mean so that stages with different scales can be meaningfully averaged.
@@ -3026,7 +3092,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             : 0;
           values.push(barHeight);
 
-          // Error bars: std of mean-normalized deviations
+          // Error bars: SE of mean-normalized deviations
           if (showErrors) {
             const deviations = [];
             stageIds.forEach(sid => {
@@ -3039,7 +3105,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               });
             });
             const devStats = stats(deviations);
-            errors.push(devStats.std);
+            errors.push(devStats.se);
           } else {
             errors.push(0);
           }
@@ -3062,7 +3128,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const runTotals = Object.values(perRun);
           const s = stats(runTotals);
           values.push(s.mean);
-          errors.push(showErrors ? s.std : 0);
+          errors.push(showErrors ? s.se : 0);
+        }
+      });
+      // Collect raw per-protocol values for scatter overlay
+      const rawPerProto = protocols.map(p => {
+        if (isRate || normalize) {
+          // Collect normalized stage means per run (one value per run)
+          const runVals = [];
+          runs.forEach(r => {
+            const sp = r.stage_protocols || {};
+            const stageMeans = [];
+            (r.stages || []).forEach(s => {
+              const stageProto = sp[s.stage_id] || s.protocol || r.protocol;
+              if (stageProto !== p) return;
+              const v = s[metric];
+              if (v == null) return;
+              let val = normalize && isAccuracy ? (1 - v) : v;
+              const sid = coalesce && taskFilter ? (getStageTag(taskFilter, s.stage_id) || s.stage_id) : s.stage_id;
+              const gm = grandMeans[sid];
+              if (normalize && gm > 0) val = val / gm;
+              stageMeans.push(val);
+            });
+            if (stageMeans.length > 0) {
+              runVals.push(stageMeans.reduce((a, b) => a + b, 0) / stageMeans.length);
+            }
+          });
+          return runVals;
+        } else {
+          const perRun = [];
+          runs.forEach(r => {
+            const sp = r.stage_protocols || {};
+            let total = 0, hasAny = false;
+            (r.stages || []).forEach(s => {
+              const stageProto = sp[s.stage_id] || s.protocol || r.protocol;
+              if (stageProto !== p) return;
+              if (s[metric] != null) { total += s[metric]; hasAny = true; }
+            });
+            if (hasAny) perRun.push(total);
+          });
+          return perRun;
         }
       });
       datasets = [{
@@ -3071,6 +3176,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         backgroundColor: VIZ_COLORS.slice(0, protocols.length),
         borderColor: VIZ_COLORS.slice(0, protocols.length),
         borderWidth: 1,
+        rawValues: rawPerProto,
       }];
       if (showErrors) {
         datasets[0].errorBars = errors;
@@ -3080,7 +3186,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       labels = stageIds.map(s => s.replace(/^\\d+_/, ''));
       datasets = protocols.map((proto, pi) => {
         const values = stageIds.map(sid => stats(dataIndex[proto]?.[sid]).mean);
-        const errs = stageIds.map(sid => stats(dataIndex[proto]?.[sid]).std);
+        const errs = stageIds.map(sid => stats(dataIndex[proto]?.[sid]).se);
+        const raw = stageIds.map(sid => dataIndex[proto]?.[sid] || []);
         return {
           label: proto,
           data: values,
@@ -3088,6 +3195,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           borderColor: VIZ_COLORS[pi % VIZ_COLORS.length],
           borderWidth: 1,
           errorBars: showErrors ? errs : null,
+          rawValues: raw,
         };
       });
     } else {
@@ -3095,7 +3203,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       labels = protocols;
       datasets = stageIds.map((sid, si) => {
         const values = protocols.map(p => stats(dataIndex[p]?.[sid]).mean);
-        const errs = protocols.map(p => stats(dataIndex[p]?.[sid]).std);
+        const errs = protocols.map(p => stats(dataIndex[p]?.[sid]).se);
+        const raw = protocols.map(p => dataIndex[p]?.[sid] || []);
         return {
           label: sid.replace(/^\\d+_/, ''),
           data: values,
@@ -3103,6 +3212,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           borderColor: VIZ_COLORS[si % VIZ_COLORS.length],
           borderWidth: 1,
           errorBars: showErrors ? errs : null,
+          rawValues: raw,
         };
       });
     }
@@ -3144,6 +3254,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     };
 
+    // Scatter overlay plugin: draw individual observations as jittered points
+    const scatterOverlayPlugin = {
+      id: 'scatterOverlay',
+      afterDatasetsDraw(chart) {
+        const c = chart.ctx;
+        const yScale = chart.scales.y;
+        chart.data.datasets.forEach((ds, di) => {
+          if (!ds.rawValues) return;
+          const meta = chart.getDatasetMeta(di);
+          meta.data.forEach((bar, i) => {
+            const vals = ds.rawValues[i];
+            if (!vals || vals.length < 2) return; // no scatter needed for 0-1 points
+            const xCenter = bar.x;
+            const barW = bar.width || 20;
+            const jitterRange = barW * 0.4; // spread within 40% of bar width
+            const color = ds.borderColor instanceof Array ? ds.borderColor[i] : ds.borderColor;
+            c.save();
+            c.fillStyle = '#fff';
+            c.globalAlpha = 0.7;
+            // Deterministic jitter based on index
+            vals.forEach((v, vi) => {
+              const yPx = yScale.getPixelForValue(v);
+              const jitter = (((vi * 7 + 3) % 11) / 10 - 0.5) * jitterRange;
+              c.beginPath();
+              c.arc(xCenter + jitter, yPx, 3, 0, 2 * Math.PI);
+              c.fill();
+            });
+            c.globalAlpha = 0.9;
+            c.strokeStyle = color;
+            c.lineWidth = 1;
+            vals.forEach((v, vi) => {
+              const yPx = yScale.getPixelForValue(v);
+              const jitter = (((vi * 7 + 3) % 11) / 10 - 0.5) * jitterRange;
+              c.beginPath();
+              c.arc(xCenter + jitter, yPx, 3, 0, 2 * Math.PI);
+              c.stroke();
+            });
+            c.restore();
+          });
+        });
+      }
+    };
+
     vizChart = new Chart(ctx, {
       type: 'bar',
       data: { labels, datasets },
@@ -3176,17 +3329,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           },
         },
       },
-      plugins: [errorBarPlugin],
+      plugins: [errorBarPlugin, scatterOverlayPlugin],
     });
 
     // Update info panel
-    const totalRuns = runs.length;
+    const totalRuns = allRuns.length;
     const multiRun = protocols.some(p =>
       stageIds.some(sid => (dataIndex[p]?.[sid]?.length || 0) > 1)
     );
-    document.getElementById('viz-info').textContent =
-      `${totalRuns} runs, ${protocols.length} protocols, ${stageIds.length} stages` +
-      (multiRun ? ' (multi-run data available)' : '');
+    let infoText = `${totalRuns} runs, ${protocols.length} protocols, ${stageIds.length} stages`;
+    if (totalFailedRuns > 0 && !isFailedRunMetric) {
+      infoText += ` (${totalFailedRuns} failed run${totalFailedRuns !== 1 ? 's' : ''} excluded)`;
+    } else if (isFailedRunMetric) {
+      infoText += ` (${totalFailedRuns} total failure${totalFailedRuns !== 1 ? 's' : ''} across all protocols)`;
+    }
+    if (multiRun) infoText += ' (multi-run data available)';
+    document.getElementById('viz-info').textContent = infoText;
   }
 
   // ---- Differential Analysis ----
@@ -3363,7 +3521,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="diff-result-header">${metric}</div>`;
 
       if (hasBaseline) {
-        html += `<div class="diff-stat"><span class="label">Baseline (${data.baseline_protocol}, n=${b.n})</span><span class="value">${b.mean.toFixed(4)} \\u00b1 ${b.std.toFixed(4)}</span></div>`;
+        html += `<div class="diff-stat"><span class="label">Baseline (${data.baseline_protocol}, n=${b.n})</span><span class="value">${b.mean.toFixed(4)} \\u00b1 ${(b.se || 0).toFixed(4)} SE</span></div>`;
       } else {
         html += '<div class="diff-stat"><span class="label">Baseline</span><span class="value" style="color:#ef4444;">No data</span></div>';
       }
@@ -3377,7 +3535,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const delta = tData.delta;
           const deltaStr = delta > 0 ? '+' + delta.toFixed(4) : delta.toFixed(4);
           const deltaClass = delta > 0 ? 'diff-delta-positive' : (delta < 0 ? 'diff-delta-negative' : '');
-          html += `<div class="diff-stat"><span class="label">${tp} (n=${t.n})</span><span class="value">${t.mean.toFixed(4)} \\u00b1 ${t.std.toFixed(4)} &nbsp; <span class="${deltaClass}" style="font-weight:700;">${deltaStr}</span></span></div>`;
+          html += `<div class="diff-stat"><span class="label">${tp} (n=${t.n})</span><span class="value">${t.mean.toFixed(4)} \\u00b1 ${(t.se || 0).toFixed(4)} SE &nbsp; <span class="${deltaClass}" style="font-weight:700;">${deltaStr}</span></span></div>`;
         } else if (!hasTreatment) {
           html += `<div class="diff-stat"><span class="label">${tp}</span><span class="value" style="color:#ef4444;">No data</span></div>`;
         }
@@ -3464,8 +3622,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const labels = [...treatments, `Baseline (${data.baseline_protocol})`];
       const values = treatments.map(tp => ((r.treatments[tp] || {}).stats || {}).mean || 0);
       values.push(r.baseline.mean || 0);
-      const errors = treatments.map(tp => ((r.treatments[tp] || {}).stats || {}).std || 0);
-      errors.push(r.baseline.std || 0);
+      const errors = treatments.map(tp => ((r.treatments[tp] || {}).stats || {}).se || 0);
+      errors.push(r.baseline.se || 0);
       const bgColors = treatments.map((_, i) => TREATMENT_COLORS[i % TREATMENT_COLORS.length] + 'cc');
       bgColors.push(BASELINE_COLOR + 'cc');
       const borderColors = treatments.map((_, i) => TREATMENT_COLORS[i % TREATMENT_COLORS.length]);
@@ -3522,8 +3680,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   // ---- Pareto Analysis ----
 
   const METRIC_DEFAULTS = {
-    'holdout_accuracy': 'higher', 'training_accuracy': 'higher',
-    'regression_rate': 'lower', 'effective_tokens': 'lower',
+    // Accuracies are converted to error rates for normalization, so lower is better
+    'holdout_accuracy': 'lower', 'training_accuracy': 'lower',
+    'regression_rate': 'lower', 'failed_run_pct': 'lower',
+    'effective_tokens': 'lower',
     'total_tokens': 'lower', 'output_tokens': 'lower',
     'wall_time_seconds': 'lower', 'human_time_seconds': 'lower',
     'code_lines': 'lower', 'input_tokens': 'lower',
@@ -3669,39 +3829,112 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     return logStageId === targetId || logStageId.endsWith('_' + targetId);
   }
 
-  function paretoComputeRaw(protocol, metric, runs, stageFilterVal) {
-    const protoRuns = runs.filter(r => r.protocol === protocol);
-    const values = [];
-    protoRuns.forEach(r => {
-      (r.stages || []).forEach(s => {
-        if (s.skipped) return;
-        if (stageFilterVal) {
-          if (stageFilterVal.startsWith('stage:')) {
-            const sid = stageFilterVal.slice(6);
-            if (!matchStageId(s.stage_id, sid)) return;
-          } else if (stageFilterVal.startsWith('tag:')) {
-            // Tag filtering: include stages whose pipeline_tags contain this tag
-            const tag = stageFilterVal.slice(4);
-            const taskPath = document.getElementById('pareto-task').value;
-            const task = vizTasksData[taskPath];
-            if (task) {
-              const stageConf = task.stages.find(ts =>
-                matchStageId(s.stage_id, ts.id)
-              );
-              if (!stageConf || !(stageConf.pipeline_tags || []).includes(tag)) return;
-            }
-          }
+  function paretoStagePassesFilter(s, stageFilterVal) {
+    if (s.skipped) return false;
+    if (stageFilterVal) {
+      if (stageFilterVal.startsWith('stage:')) {
+        const sid = stageFilterVal.slice(6);
+        if (!matchStageId(s.stage_id, sid)) return false;
+      } else if (stageFilterVal.startsWith('tag:')) {
+        const tag = stageFilterVal.slice(4);
+        const taskPath = document.getElementById('pareto-task').value;
+        const task = vizTasksData[taskPath];
+        if (task) {
+          const stageConf = task.stages.find(ts =>
+            matchStageId(s.stage_id, ts.id)
+          );
+          if (!stageConf || !(stageConf.pipeline_tags || []).includes(tag)) return false;
         }
-        const val = s[metric];
-        if (val != null) values.push(val);
+      }
+    }
+    return true;
+  }
+
+  // Compute normalized Pareto stats for all protocols at once.
+  // For each (task, stage) bin, computes the cross-protocol mean, then
+  // normalizes each protocol's per-bin mean by dividing by it. Accuracy
+  // metrics are converted to error rates (1 - acc) before normalization
+  // so that division is meaningful. The final mean/std per protocol is
+  // taken across bins, ensuring equal weighting of all task×stage
+  // combinations regardless of how many runs each has.
+  function paretoComputeNormalized(metric, protocols, runs, stageFilterVal, allRuns) {
+    const isAccuracy = ['holdout_accuracy', 'training_accuracy'].includes(metric);
+    const result = {};
+
+    // Special case: failed_run_pct is per-run, not per-stage
+    if (metric === 'failed_run_pct') {
+      protocols.forEach(proto => {
+        const source = (allRuns || runs).filter(r => r.protocol === proto);
+        if (source.length === 0) { result[proto] = null; return; }
+        const failed = source.filter(r => r.total_failure).length;
+        const pct = failed / source.length;
+        const values = source.map(r => r.total_failure ? 1 : 0);
+        let std = 0;
+        if (values.length >= 2) {
+          const variance = values.reduce((a, b) => a + (b - pct) ** 2, 0) / (values.length - 1);
+          std = Math.sqrt(variance);
+        }
+        const binValues = {};
+        source.forEach(r => { binValues[r.run_id || ''] = r.total_failure ? 1 : 0; });
+        result[proto] = { mean: pct, std, n: values.length, binValues };
+      });
+      return result;
+    }
+
+    // Step 1: Collect observations grouped by (task, stage_id) bin and protocol.
+    // For accuracy metrics, store as error rate (1 - acc).
+    const binProtoVals = {}; // binKey -> { proto -> [values across runs] }
+    runs.forEach(r => {
+      const task = (r.task || '').replace(/\/$/, '');
+      (r.stages || []).forEach(s => {
+        if (!paretoStagePassesFilter(s, stageFilterVal)) return;
+        const raw = s[metric];
+        if (raw == null) return;
+        const val = isAccuracy ? (1 - raw) : raw;
+        const binKey = `${task}::${s.stage_id}`;
+        if (!binProtoVals[binKey]) binProtoVals[binKey] = {};
+        if (!binProtoVals[binKey][r.protocol]) binProtoVals[binKey][r.protocol] = [];
+        binProtoVals[binKey][r.protocol].push(val);
       });
     });
-    if (values.length === 0) return null;
-    return values.reduce((a, b) => a + b, 0) / values.length;
+
+    // Step 2: Cross-protocol mean for each bin (mean of per-protocol means,
+    // so each protocol is weighted equally regardless of run count)
+    const binGrandMeans = {};
+    for (const [binKey, protoVals] of Object.entries(binProtoVals)) {
+      const perProtoMeans = Object.values(protoVals).map(
+        vals => vals.reduce((a, b) => a + b, 0) / vals.length
+      );
+      binGrandMeans[binKey] = perProtoMeans.reduce((a, b) => a + b, 0) / perProtoMeans.length;
+    }
+
+    // Step 3: Per protocol, compute normalized bin value (protocol's bin mean / grand mean),
+    // then mean and std across bins.
+    protocols.forEach(proto => {
+      const binValues = {}; // binKey -> normalized mean for this protocol
+      for (const [binKey, protoVals] of Object.entries(binProtoVals)) {
+        const vals = protoVals[proto];
+        if (!vals || vals.length === 0) continue;
+        const rawMean = vals.reduce((a, b) => a + b, 0) / vals.length;
+        const gm = binGrandMeans[binKey];
+        binValues[binKey] = gm > 0 ? rawMean / gm : rawMean;
+      }
+      const values = Object.values(binValues);
+      if (values.length === 0) { result[proto] = null; return; }
+      const mean = values.reduce((a, b) => a + b, 0) / values.length;
+      let std = 0;
+      if (values.length >= 2) {
+        const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1);
+        std = Math.sqrt(variance);
+      }
+      result[proto] = { mean, std, n: values.length, binValues };
+    });
+
+    return result;
   }
 
   function paretoComputeDiff(protocol, metric, runs, baselineProto, aStages, bStages) {
-    if (protocol === baselineProto) return 0; // baseline is the reference
+    if (protocol === baselineProto) return { mean: 0, std: 0, n: 0, binValues: {} };
 
     function getStageProto(log, stageId) {
       const sp = log.stage_protocols || {};
@@ -3713,10 +3946,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return log.protocol;
     }
 
-    // Treatment runs: protocol on A, baseline on B
-    const treatmentBVals = [];
-    // Baseline runs: baseline on all A+B
-    const baselineBVals = [];
+    // Per-run treatment B-stage mean and baseline B-stage mean
+    const treatmentRunVals = {}; // run_id -> mean of B-stage values
+    const baselineRunVals = {};
 
     runs.forEach(log => {
       const protoMap = {};
@@ -3728,24 +3960,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const bBaseline = bStages.every(s => protoMap[s] === baselineProto);
       const allBaseline = [...aStages, ...bStages].every(s => protoMap[s] === baselineProto);
 
+      const rid = log.run_id || `_anon_${Math.random()}`;
       if (aTreatment && bBaseline) {
+        const vals = [];
         bStages.forEach(sid => {
           const stage = (log.stages || []).find(s => matchStageId(s.stage_id, sid));
-          if (stage && stage[metric] != null) treatmentBVals.push(stage[metric]);
+          if (stage && stage[metric] != null) vals.push(stage[metric]);
         });
+        if (vals.length > 0) treatmentRunVals[rid] = vals.reduce((a, b) => a + b, 0) / vals.length;
       }
       if (allBaseline) {
+        const vals = [];
         bStages.forEach(sid => {
           const stage = (log.stages || []).find(s => matchStageId(s.stage_id, sid));
-          if (stage && stage[metric] != null) baselineBVals.push(stage[metric]);
+          if (stage && stage[metric] != null) vals.push(stage[metric]);
         });
+        if (vals.length > 0) baselineRunVals[rid] = vals.reduce((a, b) => a + b, 0) / vals.length;
       }
     });
 
-    if (treatmentBVals.length === 0 || baselineBVals.length === 0) return null;
-    const tMean = treatmentBVals.reduce((a, b) => a + b, 0) / treatmentBVals.length;
-    const bMean = baselineBVals.reduce((a, b) => a + b, 0) / baselineBVals.length;
-    return tMean - bMean;
+    const tVals = Object.values(treatmentRunVals);
+    const bVals = Object.values(baselineRunVals);
+    if (tVals.length === 0 || bVals.length === 0) return null;
+    const tMean = tVals.reduce((a, b) => a + b, 0) / tVals.length;
+    const bMean = bVals.reduce((a, b) => a + b, 0) / bVals.length;
+    const diffMean = tMean - bMean;
+    // Propagate uncertainty: pooled std of per-run values
+    let std = 0;
+    const allVals = [...tVals, ...bVals];
+    const n = allVals.length;
+    if (n >= 2) {
+      const pooledMean = allVals.reduce((a, b) => a + b, 0) / n;
+      const variance = allVals.reduce((a, b) => a + (b - pooledMean) ** 2, 0) / (n - 1);
+      std = Math.sqrt(variance);
+    }
+    // binValues: use treatment per-run means for covariance pairing
+    return { mean: diffMean, std, n, binValues: treatmentRunVals };
   }
 
   function computeParetoFront(points, xHigherBetter, yHigherBetter) {
@@ -3795,7 +4045,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Filter runs
+    // Filter runs (exclude total failures from normal metrics)
     let runs = vizLogsData;
     if (taskFilter) {
       runs = runs.filter(r => {
@@ -3803,25 +4053,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         return rt === taskFilter || rt.endsWith('/' + taskFilter.split('/').pop());
       });
     }
+    const allParetoRuns = runs; // keep unfiltered for failed_run_pct
+    runs = runs.filter(r => !r.total_failure);
 
-    // Get protocols
-    const protocols = [...new Set(runs.map(r => r.protocol))].sort();
+    // Get protocols (from all runs so failed-only protocols still appear for failed_run_pct)
+    const protocols = [...new Set(allParetoRuns.map(r => r.protocol))].sort();
+
+    // Precompute normalized stats for raw-mode metrics (batch across all protocols)
+    const xNorm = xMode !== 'differential'
+      ? paretoComputeNormalized(xMetric, protocols, runs, stageFilterVal, allParetoRuns) : null;
+    const yNorm = yMode !== 'differential'
+      ? paretoComputeNormalized(yMetric, protocols, runs, stageFilterVal, allParetoRuns) : null;
 
     // Compute points
     const points = [];
     const skipped = [];
     protocols.forEach(proto => {
-      const x = xMode === 'differential'
+      const xStats = xMode === 'differential'
         ? paretoComputeDiff(proto, xMetric, runs, baselineProto, aStages, bStages)
-        : paretoComputeRaw(proto, xMetric, runs, stageFilterVal);
-      const y = yMode === 'differential'
+        : xNorm[proto];
+      const yStats = yMode === 'differential'
         ? paretoComputeDiff(proto, yMetric, runs, baselineProto, aStages, bStages)
-        : paretoComputeRaw(proto, yMetric, runs, stageFilterVal);
+        : yNorm[proto];
 
-      if (x == null || y == null) {
+      if (xStats == null || yStats == null) {
         skipped.push(proto);
       } else {
-        points.push({ protocol: proto, x, y });
+        // Compute covariance from paired bin values (keyed by task::stage or run_id)
+        let cov = 0;
+        const xBV = xStats.binValues || {};
+        const yBV = yStats.binValues || {};
+        const pairedIds = Object.keys(xBV).filter(k => k in yBV);
+        if (pairedIds.length >= 2) {
+          const xPaired = pairedIds.map(k => xBV[k]);
+          const yPaired = pairedIds.map(k => yBV[k]);
+          const xm = xPaired.reduce((a, b) => a + b, 0) / xPaired.length;
+          const ym = yPaired.reduce((a, b) => a + b, 0) / yPaired.length;
+          cov = xPaired.reduce((s, xi, i) => s + (xi - xm) * (yPaired[i] - ym), 0) / (pairedIds.length - 1);
+        }
+        points.push({
+          protocol: proto,
+          x: xStats.mean, y: yStats.mean,
+          xStd: xStats.std, yStd: yStats.std,
+          xN: xStats.n, yN: yStats.n,
+          covXY: cov, nPaired: pairedIds.length,
+        });
       }
     });
 
@@ -3834,19 +4110,97 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     const front = computeParetoFront(points, xDir === 'higher', yDir === 'higher');
 
     // Build axis labels
-    const xLabel = xMode === 'differential' ? `Δ ${xMetric}` : xMetric;
-    const yLabel = yMode === 'differential' ? `Δ ${yMetric}` : yMetric;
+    const isAccX = ['holdout_accuracy', 'training_accuracy'].includes(xMetric);
+    const isAccY = ['holdout_accuracy', 'training_accuracy'].includes(yMetric);
+    const xLabel = xMode === 'differential' ? `Δ ${xMetric}`
+      : `${isAccX ? 'error rate' : xMetric} (normalized)`;
+    const yLabel = yMode === 'differential' ? `Δ ${yMetric}`
+      : `${isAccY ? 'error rate' : yMetric} (normalized)`;
 
     // Chart.js datasets
     const scatterData = points.map(p => ({ x: p.x, y: p.y }));
     const frontData = front.map(p => ({ x: p.x, y: p.y }));
 
-    // Plugin to label points
-    const pointLabelPlugin = {
-      id: 'paretoPointLabels',
+    // Plugin to draw error ellipses and label points
+    const paretoPlugins = {
+      id: 'paretoOverlays',
       afterDatasetsDraw(chart) {
         const meta = chart.getDatasetMeta(0);
         const c = chart.ctx;
+        const xScale = chart.scales.x;
+        const yScale = chart.scales.y;
+
+        // Draw error ellipses (±1 SE) with full covariance
+        meta.data.forEach((pt, i) => {
+          if (i >= points.length) return;
+          const p = points[i];
+          if (p.xN < 2 && p.yN < 2) return;
+
+          const n = p.nPaired >= 2 ? p.nPaired : Math.min(p.xN, p.yN);
+          if (n < 2) return;
+
+          // Build 2x2 covariance-of-the-mean matrix (SE² terms)
+          const varX = p.xN >= 2 ? (p.xStd * p.xStd) / p.xN : 0;
+          const varY = p.yN >= 2 ? (p.yStd * p.yStd) / p.yN : 0;
+          const covXY = p.nPaired >= 2 ? p.covXY / p.nPaired : 0;
+
+          // Eigenvalues of [[varX, covXY],[covXY, varY]]
+          const trace = varX + varY;
+          const det = varX * varY - covXY * covXY;
+          const disc = Math.sqrt(Math.max(trace * trace / 4 - det, 0));
+          const lam1 = trace / 2 + disc;
+          const lam2 = trace / 2 - disc;
+          if (lam1 <= 0 && lam2 <= 0) return;
+
+          // Rotation angle from eigenvector of larger eigenvalue
+          let angle = 0;
+          if (Math.abs(covXY) > 1e-15) {
+            angle = Math.atan2(lam1 - varX, covXY);
+          } else {
+            angle = varX >= varY ? 0 : Math.PI / 2;
+          }
+
+          // ±1 SE radii in data space
+          const seA = Math.sqrt(Math.max(lam1, 0));
+          const seB = Math.sqrt(Math.max(lam2, 0));
+
+          // Convert data-space SE to pixel-space radii
+          const cx = pt.x;
+          const cy = pt.y;
+          // Pixel scale factors (may differ for x vs y)
+          const pxPerX = Math.abs(xScale.getPixelForValue(1) - xScale.getPixelForValue(0));
+          const pxPerY = Math.abs(yScale.getPixelForValue(1) - yScale.getPixelForValue(0));
+
+          // Transform the ellipse axes to pixel space
+          // The eigenvector gives direction (cos(angle), sin(angle)) in data space;
+          // in pixel space that becomes (cos(angle)*pxPerX, sin(angle)*pxPerY)
+          // We approximate by scaling the radii and adjusting the angle
+          const cosA = Math.cos(angle), sinA = Math.sin(angle);
+          const pixAngle = Math.atan2(sinA * pxPerY, cosA * pxPerX);
+          const rA = Math.sqrt((seA * cosA * pxPerX) ** 2 + (seA * sinA * pxPerY) ** 2);
+          const cosB = Math.cos(angle + Math.PI / 2), sinB = Math.sin(angle + Math.PI / 2);
+          const rB = Math.sqrt((seB * cosB * pxPerX) ** 2 + (seB * sinB * pxPerY) ** 2);
+
+          if (rA < 1 && rB < 1) return;
+
+          const color = getProtocolColor(p.protocol);
+          c.save();
+          c.globalAlpha = 0.15;
+          c.fillStyle = color;
+          c.beginPath();
+          c.ellipse(cx, cy, Math.max(rA, 2), Math.max(rB, 2), pixAngle, 0, 2 * Math.PI);
+          c.fill();
+          c.globalAlpha = 0.5;
+          c.strokeStyle = color;
+          c.lineWidth = 1.5;
+          c.setLineDash([4, 3]);
+          c.beginPath();
+          c.ellipse(cx, cy, Math.max(rA, 2), Math.max(rB, 2), pixAngle, 0, 2 * Math.PI);
+          c.stroke();
+          c.restore();
+        });
+
+        // Draw point labels
         c.font = '11px system-ui, sans-serif';
         c.fillStyle = '#ccc';
         c.textAlign = 'left';
@@ -3898,7 +4252,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               label: (ctx) => {
                 if (ctx.datasetIndex === 0 && ctx.dataIndex < points.length) {
                   const p = points[ctx.dataIndex];
-                  return `${p.protocol}: (${p.x.toFixed(4)}, ${p.y.toFixed(4)})`;
+                  const lines = [`${p.protocol}: (${p.x.toFixed(4)}, ${p.y.toFixed(4)})`];
+                  const xSE = p.xN >= 2 ? p.xStd / Math.sqrt(p.xN) : null;
+                  const ySE = p.yN >= 2 ? p.yStd / Math.sqrt(p.yN) : null;
+                  if (xSE != null) lines.push(`  x SE: ±${xSE.toFixed(4)} (n=${p.xN})`);
+                  if (ySE != null) lines.push(`  y SE: ±${ySE.toFixed(4)} (n=${p.yN})`);
+                  return lines;
                 }
                 return '';
               }
@@ -3916,7 +4275,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           },
         }
       },
-      plugins: [pointLabelPlugin],
+      plugins: [paretoPlugins],
     });
 
     // Info panel
