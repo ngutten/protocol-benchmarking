@@ -1,6 +1,6 @@
 # Benchmarking Protocols
 
-[[pareto.png]]
+![Pareto plot screenshot](pareto.png)
 
 This repo centers around benchmarking different protocols for AI-assisted code development (in this case, focusing on Claude Code CLI). The idea is not to compare different models, but for a fixed model to compare different ways of working with it.
 
