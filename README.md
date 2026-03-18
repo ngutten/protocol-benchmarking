@@ -23,9 +23,24 @@ We currently have four tasks and are adding more:
 - **cellautomata**: A task to make a Conway's Game of Life simulator with a UI using PySide6, and then extend it to other CAs. Strongly sensitive to code optimization choices.
 - **maze**: A task to make a web-based maze exploration game, tests UI and web development, as well as behavior when things are underspecified (the specific web technology is not specified, the maze procedural generation algorithm is not specified)
 
-The tasks have a variety of requirements, so be aware:
+## Setup
 
-- Web UI tasks require playwright to be installed (pip install playwright) and specifically the chromium browser (playwright install chromium)
-- Python UI tasks require PySide6 
+Install all dependencies:
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+The tasks have a variety of requirements:
+
+| Dependency | Used by |
+|------------|---------|
+| pytest, fastapi, pyyaml | Core harness |
+| PySide6, pytest-qt, numpy, scipy | CellAutomata |
+| matplotlib, numpy | PlotCurve |
+| playwright, Pillow | Maze |
+
+You also need `git` and `python3` available on your PATH.
 
 If you're seeing tasks fail with 0/N tests passed, it can be because of a missing install that Claude does not have permissions to correct.

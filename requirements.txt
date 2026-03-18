@@ -1,0 +1,17 @@
+# Core harness
+pytest
+fastapi
+pyyaml
+
+# CellAutomata task (Qt GUI)
+PySide6
+pytest-qt
+numpy
+scipy
+
+# PlotCurve task
+matplotlib
+
+# Maze task (browser-based UI)
+playwright
+Pillow
