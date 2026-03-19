@@ -260,7 +260,7 @@ def run_perf_tests(test_path, engine_cmd, conftest_dir=None, timeout=300):
     return results
 
 
-def count_code(project_dir, extensions=(".py", ".cpp", ".cc", ".h", ".hpp", ".rs", ".ts", ".js")):
+def count_code(project_dir, extensions=(".py", ".cpp", ".cc", ".h", ".hpp", ".rs", ".ts", ".js", ".html", ".css", ".svg", ".go", ".c", ".java")):
     """Count lines and bytes of source code."""
     total_lines = 0
     total_bytes = 0
