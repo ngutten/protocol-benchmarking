@@ -118,13 +118,14 @@ class StageMetrics:
 def run_pytest(test_path, engine_cmd, conftest_dir=None, timeout=120):
     """Run pytest on a test file/dir and return structured results."""
     env = os.environ.copy()
-    env["MINIDB_ENGINE_CMD"] = engine_cmd
+    env["ENGINE_CMD"] = engine_cmd
     cmd = ["python3", "-m", "pytest", test_path, "-v", "--tb=short"]
     if conftest_dir:
         cmd.extend(["--rootdir", conftest_dir, "-c", "/dev/null"])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout + 30)
     except subprocess.TimeoutExpired:
+        print(f"\n      TIMEOUT after {timeout}s: {os.path.basename(test_path)}", flush=True)
         return [], 1
     tests = []
     for line in result.stdout.splitlines():
@@ -133,6 +134,15 @@ def run_pytest(test_path, engine_cmd, conftest_dir=None, timeout=120):
             tests.append(TestResult(
                 name=m.group(1), passed=(m.group(2) == "PASSED"),
             ))
+    if not tests and result.returncode != 0:
+        # Log stderr for debugging collection/import errors
+        stderr_snippet = result.stderr.strip()[:500] if result.stderr else ""
+        stdout_snippet = result.stdout.strip()[-500:] if result.stdout else ""
+        if stderr_snippet or stdout_snippet:
+            print(f"\n      WARN: 0 tests from {os.path.basename(test_path)} "
+                  f"(rc={result.returncode})", flush=True)
+            if stderr_snippet:
+                print(f"        stderr: {stderr_snippet[:200]}", flush=True)
     return tests, result.returncode
 
 
@@ -165,7 +175,7 @@ def run_perf_tests(test_path, engine_cmd, conftest_dir=None, timeout=300):
         list[PerfResult]: One entry per test, with captured duration.
     """
     env = os.environ.copy()
-    env["MINIDB_ENGINE_CMD"] = engine_cmd
+    env["ENGINE_CMD"] = engine_cmd
     cmd = [
         "python3", "-m", "pytest", test_path,
         "-v", "-s", "--tb=short", "--durations=0",
@@ -278,8 +288,14 @@ def count_code(project_dir, extensions=(".py", ".cpp", ".cc", ".h", ".hpp", ".rs
     return total_lines, total_bytes
 
 
-def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd, previous_stages):
-    """Collect all metrics after a completed stage."""
+def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd, previous_stages, timeout=120, previously_passed=None):
+    """Collect all metrics after a completed stage.
+
+    Args:
+        previously_passed: Optional set of test names that passed in earlier stages.
+            When provided, regressions only count tests that were in this set but now fail.
+            When None, all failures on previous-stage tests count as regressions (legacy behavior).
+    """
     metrics = StageMetrics(stage_id=stage_id, protocol=protocol)
     metrics.code_lines, metrics.code_bytes = count_code(project_dir)
 
@@ -291,7 +307,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
     tp = os.path.join(test_dir, "training")
     for f in os.listdir(tp) if os.path.isdir(tp) else []:
         if (stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f))) and f.endswith(".py"):
-            results, _ = run_pytest(os.path.join(tp, f), engine_cmd, conftest_dir)
+            results, _ = run_pytest(os.path.join(tp, f), engine_cmd, conftest_dir, timeout=timeout)
             metrics.training_tests_total += len(results)
             metrics.training_tests_passed += sum(1 for r in results if r.passed)
             for r in results:
@@ -302,7 +318,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
     hp = os.path.join(test_dir, "holdout")
     for f in os.listdir(hp) if os.path.isdir(hp) else []:
         if (stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f))) and f.endswith(".py"):
-            results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir)
+            results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir, timeout=timeout)
             metrics.holdout_tests_total += len(results)
             metrics.holdout_tests_passed += sum(1 for r in results if r.passed)
             for r in results:
@@ -310,16 +326,19 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
             metrics.test_results.extend(results)
 
     # Regression: holdout tests from previous stages
+    # Only count a failure as a regression if the test previously passed
     reg_total = reg_failed = 0
     for prev in previous_stages:
         prev_prefix = prev.split("_")[0] if "_" in prev else ""
         for f in os.listdir(hp) if os.path.isdir(hp) else []:
             if (prev in f or (prev_prefix and re.match(rf"test_{prev_prefix}_", f))) and f.endswith(".py"):
-                results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir)
-                reg_total += len(results)
-                reg_failed += sum(1 for r in results if not r.passed)
+                results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir, timeout=timeout)
                 for r in results:
                     r.stage, r.pool = prev, "regression"
+                    reg_total += 1
+                    if not r.passed:
+                        if previously_passed is None or r.name in previously_passed:
+                            reg_failed += 1
                 metrics.test_results.extend(results)
     metrics.regression_tests_total = reg_total
     metrics.regression_tests_failed = reg_failed
@@ -332,7 +351,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
                 continue
             # Match by stage_id or numeric prefix, same as holdout
             if stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f)):
-                perf_results = run_perf_tests(os.path.join(pp, f), engine_cmd, conftest_dir)
+                perf_results = run_perf_tests(os.path.join(pp, f), engine_cmd, conftest_dir, timeout=max(timeout, 300))
                 metrics.perf_tests_total += len(perf_results)
                 metrics.perf_tests_passed += sum(1 for r in perf_results if r.passed)
                 for r in perf_results:

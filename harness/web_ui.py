@@ -26,7 +26,7 @@ from .experiment import Experiment, setup_run_directory, load_task_config, resol
 from .metrics import collect_stage_metrics
 from .protocols import ALL_PROTOCOLS
 from .state_tree import StateTree, TreeNode
-from .token_usage import get_session_token_usage
+from .token_usage import get_session_token_usage, get_denied_tool_calls
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -66,6 +66,12 @@ class RunSession:
         self.current_task_name = task_name
         self.harness_log: list = []    # circular buffer of harness debug messages
         self.stage_protocols: dict = {}  # stage_id -> protocol_name for per-stage overrides
+        # Multi-phase protocol state
+        self.phase_index: int = -1           # current phase index (-1 = not in multi-phase)
+        self.phase_defs: list = []           # list of PhaseDef (or synthetic defs for planning_phase)
+        self.phase_session_ids: list = []    # session IDs collected across phases
+        self.phase_token_data: dict = {}     # accumulated token data across phases
+        self.phase_breakdown: list = []      # per-phase metrics for reporting
 
     def cleanup(self):
         """Clean up PTY resources."""
@@ -246,13 +252,19 @@ def init_experiment(task_dir: str, protocol_name: str, work_dir: str = None,
 
 
 def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = False,
-                      session: RunSession = None) -> tuple:
+                      session: RunSession = None,
+                      permission_mode: str = None, model: str = None) -> tuple:
     """Spawn claude in a PTY. Returns (master_fd, child_pid).
 
     If headless=True, uses `claude -p` so the process exits on completion.
     The PTY still provides terminal I/O for permission prompts.
+
+    Args:
+        permission_mode: Override the permission mode (used by multi-phase protocols).
+        model: Override the model (used by per-phase model overrides).
     """
-    cmd_parts = ["claude", "--model", protocol.model]
+    effective_model = model or protocol.model
+    cmd_parts = ["claude", "--model", effective_model]
 
     if protocol.custom_command:
         from .claude_runner import _expand_custom_command
@@ -260,7 +272,9 @@ def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = Fal
     else:
         if headless:
             cmd_parts.extend(["-p", "--output-format", "text"])
-        if getattr(protocol, 'permission_mode', None):
+        if permission_mode:
+            cmd_parts.extend(["--permission-mode", permission_mode])
+        elif getattr(protocol, 'permission_mode', None):
             cmd_parts.extend(["--permission-mode", protocol.permission_mode])
         elif headless:
             cmd_parts.extend(["--permission-mode", "acceptEdits"])
@@ -288,6 +302,132 @@ def _spawn_claude_pty(work_dir: str, prompt: str, protocol, headless: bool = Fal
 def _kill_pty(session: RunSession):
     """Kill the PTY process for a session."""
     session.cleanup()
+
+
+def _build_phase_defs(protocol, prompt):
+    """Build a list of phase definitions for a protocol.
+
+    For protocols with explicit phases (sequential_pipeline, plan_parallel_implement),
+    returns those phases directly.
+
+    For planning_phase protocols (plan_and_implement), synthesizes two PhaseDef
+    objects: one for planning and one for implementation.
+
+    Returns an empty list for protocols that are neither multi-phase nor planning.
+    """
+    from .protocols import PhaseDef
+
+    if protocol.phases:
+        # Expand parallel_prompts into sequential sub-phases for PTY execution.
+        # (True parallelism requires subprocess-based run_headless; the PTY UI
+        # runs them sequentially which is correct but slower.)
+        expanded = []
+        for phase in protocol.phases:
+            if phase.parallel_prompts:
+                for i, pp in enumerate(phase.parallel_prompts):
+                    expanded.append(PhaseDef(
+                        name=f"{phase.name}_{i}",
+                        prompt_template=pp,
+                        permission_mode=phase.permission_mode,
+                        model=phase.model,
+                        timeout=phase.timeout,
+                    ))
+            else:
+                expanded.append(phase)
+        return expanded
+
+    if protocol.planning_phase and protocol.planning_prompt:
+        return [
+            PhaseDef(
+                name="plan",
+                prompt_template=protocol.planning_prompt,
+                permission_mode="acceptEdits",
+            ),
+            PhaseDef(
+                name="implement",
+                prompt_template=(
+                    "Read PLAN.md for the implementation plan, then implement it.\n\n" + prompt
+                ),
+                permission_mode="acceptEdits",
+            ),
+        ]
+
+    return []
+
+
+def _get_phase_prompt(phase, prompt, prev_result=""):
+    """Build the prompt text for a phase.
+
+    For planning_phase protocols, the implement phase injects the plan result.
+    For explicit-phase protocols, expands the prompt_template with format_map.
+    """
+    from .claude_runner import _SafeFormatDict
+    phase_context = _SafeFormatDict(prompt=prompt, prev_result=prev_result)
+    return phase.prompt_template.format_map(phase_context)
+
+
+def _init_phase_state(session, protocol, prompt):
+    """Initialize multi-phase tracking on the session.
+
+    Returns True if the protocol is multi-phase and state was initialized.
+    """
+    phase_defs = _build_phase_defs(protocol, prompt)
+    if not phase_defs:
+        return False
+
+    session.phase_index = 0
+    session.phase_defs = phase_defs
+    session.phase_session_ids = []
+    session.phase_token_data = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+    }
+    session.phase_breakdown = []
+    return True
+
+
+def _reset_phase_state(session):
+    """Clear multi-phase tracking state."""
+    session.phase_index = -1
+    session.phase_defs = []
+    session.phase_session_ids = []
+    session.phase_token_data = {}
+    session.phase_breakdown = []
+
+
+def _spawn_current_phase(session):
+    """Spawn the PTY for the current phase. Returns (master_fd, child_pid)."""
+    exp = session.experiment
+    protocol = exp.get_protocol_for_stage(session.stages[session.current_stage_idx])
+    phase = session.phase_defs[session.phase_index]
+
+    # Build the prompt from the phase template
+    prev = session.phase_breakdown[-1].get("result", "") if session.phase_breakdown else ""
+    prompt_text = _get_phase_prompt(phase, "", prev)
+
+    perm = phase.permission_mode or "acceptEdits"
+    model = phase.model or protocol.model
+    headless = session.auto_mode
+
+    _harness_log(
+        f"phase: starting '{phase.name}' ({session.phase_index + 1}/{len(session.phase_defs)}) "
+        f"perm={perm} model={model} headless={headless}",
+        session,
+    )
+
+    _kill_pty(session)
+    master_fd, child_pid = _spawn_claude_pty(
+        str(exp.work_dir), prompt_text, protocol,
+        headless=headless, session=session,
+        permission_mode=perm, model=model,
+    )
+    session.pty_fd = master_fd
+    session.child_pid = child_pid
+    session.pty_generation += 1
+    return master_fd, child_pid
 
 
 def _compute_human_time(session: RunSession) -> float:
@@ -449,6 +589,67 @@ def _migrate_legacy_logs():
     _harness_log("migrate: legacy log migration complete")
 
 
+async def _advance_phase(session: RunSession) -> bool:
+    """Collect token data for the just-finished phase, then start the next one.
+
+    Returns True if a new phase was spawned, False if all phases are done.
+    """
+    exp = session.experiment
+    loop = asyncio.get_event_loop()
+
+    phase = session.phase_defs[session.phase_index]
+    _harness_log(f"phase: '{phase.name}' finished ({session.phase_index + 1}/{len(session.phase_defs)})", session)
+
+    # Clean up finished PTY fd (process already exited)
+    session.child_pid = None
+    session.pty_monitor_task = None
+    if session.pty_fd is not None:
+        try:
+            os.close(session.pty_fd)
+        except OSError:
+            pass
+        session.pty_fd = None
+
+    # Collect session ID and token usage for this phase
+    claude_session_id = await loop.run_in_executor(
+        _pty_executor, _find_latest_session_id, str(exp.work_dir))
+
+    phase_record = {
+        "phase_name": phase.name,
+        "session_ids": [claude_session_id] if claude_session_id else [],
+        "result": "",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "wall_time_seconds": 0,
+        "is_error": False,
+    }
+
+    if claude_session_id:
+        session.phase_session_ids.append(claude_session_id)
+        usage = await loop.run_in_executor(
+            _pty_executor, get_session_token_usage, claude_session_id)
+        if usage["total_tokens"] > 0:
+            for key in ("input_tokens", "output_tokens", "total_tokens",
+                        "cache_read_tokens", "cache_creation_tokens"):
+                session.phase_token_data[key] = session.phase_token_data.get(key, 0) + usage.get(key, 0)
+            phase_record.update(usage)
+
+    session.phase_breakdown.append(phase_record)
+
+    # Advance to next phase
+    session.phase_index += 1
+    if session.phase_index >= len(session.phase_defs):
+        _harness_log(f"phase: all {len(session.phase_defs)} phases complete", session)
+        return False
+
+    # Spawn next phase
+    _spawn_current_phase(session)
+    return True
+
+
 async def _monitor_pty_exit(session: RunSession):
     """Background task that monitors the child PID for exit.
 
@@ -486,19 +687,31 @@ async def _monitor_pty_exit(session: RunSession):
         _harness_log("monitor: stage already completed (manual or race), skipping auto-complete", session)
         return
 
-    await _auto_complete_stage(session)
+    # Multi-phase: collect phase data and advance to next phase if not done
+    if session.phase_index >= 0 and session.phase_index < len(session.phase_defs):
+        advanced = await _advance_phase(session)
+        if advanced:
+            # More phases to go — monitor the new PTY
+            session.pty_monitor_task = asyncio.create_task(_monitor_pty_exit(session))
+            return
 
-    # Auto-advance if enabled
-    if session.auto_advance:
+    # All phases done (or single-phase) — complete the stage
+    completed = await _auto_complete_stage(session)
+
+    # Auto-advance if enabled (only if stage completed successfully)
+    if completed and session.auto_advance:
         await _auto_start_next_stage(session)
 
 
-async def _auto_complete_stage(session: RunSession):
-    """Programmatically complete the current stage (same logic as POST /api/stage/complete)."""
+async def _auto_complete_stage(session: RunSession) -> bool:
+    """Programmatically complete the current stage (same logic as POST /api/stage/complete).
+
+    Returns True if the stage was completed successfully, False otherwise.
+    """
     exp = session.experiment
     if exp is None or session.current_stage_idx < 0:
         _harness_log(f"auto_complete: skipped (exp={exp is not None}, idx={session.current_stage_idx})", session)
-        return
+        return False
 
     stage_id = session.stages[session.current_stage_idx]
     _harness_log(f"auto_complete: starting for stage {stage_id} (idx={session.current_stage_idx})", session)
@@ -529,16 +742,40 @@ async def _auto_complete_stage(session: RunSession):
     claude_session_id = await loop.run_in_executor(
         _pty_executor, _find_latest_session_id, str(exp.work_dir))
 
-    # Get token usage
+    # Get token usage and denied tool calls
     token_data = None
-    if claude_session_id:
-        usage = await loop.run_in_executor(
-            _pty_executor, get_session_token_usage, claude_session_id)
-        if usage["total_tokens"] > 0:
-            token_data = usage
+
+    if session.phase_breakdown:
+        # Multi-phase: all phase token data was accumulated in _advance_phase
+        token_data = dict(session.phase_token_data)
+        token_data["phase_breakdown"] = list(session.phase_breakdown)
+
+        # Collect denied tool calls across all phase sessions
+        all_denied = []
+        for sid in session.phase_session_ids:
+            if sid:
+                denied = await loop.run_in_executor(
+                    _pty_executor, get_denied_tool_calls, sid)
+                all_denied.extend(denied)
+        if all_denied:
+            token_data["denied_tool_calls"] = all_denied
+
+        _reset_phase_state(session)
+    else:
+        if claude_session_id:
+            usage = await loop.run_in_executor(
+                _pty_executor, get_session_token_usage, claude_session_id)
+            if usage["total_tokens"] > 0:
+                token_data = usage
+            denied = await loop.run_in_executor(
+                _pty_executor, get_denied_tool_calls, claude_session_id)
+            if denied:
+                if token_data is None:
+                    token_data = {}
+                token_data["denied_tool_calls"] = denied
 
     # Complete stage via experiment (runs tests — can be slow)
-    _harness_log(f"auto_complete: running metrics for {stage_id} (claude_session={claude_session_id}, tokens={token_data.get('total_tokens', 0) if token_data else 0})", session)
+    _harness_log(f"auto_complete: running metrics for {stage_id} (claude_session={claude_session_id}, tokens={token_data.get('total_tokens', 0) if token_data else 0}, phases={len(session.phase_breakdown) if session.phase_breakdown else 0})", session)
     try:
         metrics = await loop.run_in_executor(
             _pty_executor,
@@ -548,7 +785,7 @@ async def _auto_complete_stage(session: RunSession):
         _harness_log(f"auto_complete: ERROR in complete_stage: {e}", session)
         session.auto_status = None
         session.current_stage_idx = -1
-        return
+        return False
 
     session.stage_metrics.append(metrics_dict)
     session.current_stage_idx = -1
@@ -558,6 +795,7 @@ async def _auto_complete_stage(session: RunSession):
     # Auto-save log and consolidate
     await loop.run_in_executor(_pty_executor, exp.save_log)
     await loop.run_in_executor(_pty_executor, _consolidate_log, exp)
+    return True
 
 
 async def _auto_start_next_stage(session: RunSession):
@@ -608,12 +846,21 @@ async def _auto_start_next_stage(session: RunSession):
     # Spawn claude in PTY with headless mode (use per-stage protocol)
     _kill_pty(session)
     stage_protocol = exp.get_protocol_for_stage(stage_id)
-    master_fd, child_pid = _spawn_claude_pty(
-        str(exp.work_dir), prompt, stage_protocol, headless=True, session=session
-    )
-    session.pty_fd = master_fd
-    session.child_pid = child_pid
-    session.pty_generation += 1
+
+    # Check for multi-phase protocol
+    is_multiphase = _init_phase_state(session, stage_protocol, prompt)
+
+    if is_multiphase:
+        master_fd, child_pid = _spawn_current_phase(session)
+    else:
+        _reset_phase_state(session)
+        master_fd, child_pid = _spawn_claude_pty(
+            str(exp.work_dir), prompt, stage_protocol, headless=True, session=session
+        )
+        session.pty_fd = master_fd
+        session.child_pid = child_pid
+        session.pty_generation += 1
+
     session.auto_status = "running"
 
     # Start monitoring for this new stage
@@ -882,6 +1129,12 @@ async def get_state(session_id: str = None):
         "task_dir": session.task_dir,
         "current_task_name": session.current_task_name,
         "stage_protocols": session.stage_protocols,
+        "phase_info": {
+            "current_phase": session.phase_index,
+            "total_phases": len(session.phase_defs),
+            "phase_name": session.phase_defs[session.phase_index].name
+                if 0 <= session.phase_index < len(session.phase_defs) else None,
+        } if session.phase_defs else None,
     }
 
 
@@ -931,17 +1184,30 @@ async def start_stage(request: FastAPIRequest):
     _kill_pty(session)
     headless = session.auto_mode
     stage_protocol = exp.get_protocol_for_stage(stage_id)
-    master_fd, child_pid = _spawn_claude_pty(
-        str(exp.work_dir), prompt, stage_protocol, headless=headless, session=session
-    )
-    session.pty_fd = master_fd
-    session.child_pid = child_pid
-    session.pty_generation += 1
 
-    # In auto mode, start monitoring for process exit
-    if headless:
-        session.auto_status = "running"
+    # Check for multi-phase protocol
+    is_multiphase = _init_phase_state(session, stage_protocol, prompt)
+
+    if is_multiphase:
+        # Start the first phase (works in both headless and interactive modes)
+        master_fd, child_pid = _spawn_current_phase(session)
+        if headless:
+            session.auto_status = "running"
         session.pty_monitor_task = asyncio.create_task(_monitor_pty_exit(session))
+    else:
+        # Single-phase: spawn directly as before
+        _reset_phase_state(session)
+        master_fd, child_pid = _spawn_claude_pty(
+            str(exp.work_dir), prompt, stage_protocol, headless=headless, session=session
+        )
+        session.pty_fd = master_fd
+        session.child_pid = child_pid
+        session.pty_generation += 1
+
+        # In auto mode, start monitoring for process exit
+        if headless:
+            session.auto_status = "running"
+            session.pty_monitor_task = asyncio.create_task(_monitor_pty_exit(session))
 
     return {"session_id": session.session_id, "stage_id": stage_id, "stage_idx": next_idx, "prompt": prompt}
 
@@ -978,13 +1244,19 @@ async def complete_stage(request: FastAPIRequest):
     claude_session_id = await loop.run_in_executor(
         _pty_executor, _find_latest_session_id, str(exp.work_dir))
 
-    # Get token usage
+    # Get token usage and denied tool calls
     token_data = None
     if claude_session_id:
         usage = await loop.run_in_executor(
             _pty_executor, get_session_token_usage, claude_session_id)
         if usage["total_tokens"] > 0:
             token_data = usage
+        denied = await loop.run_in_executor(
+            _pty_executor, get_denied_tool_calls, claude_session_id)
+        if denied:
+            if token_data is None:
+                token_data = {}
+            token_data["denied_tool_calls"] = denied
 
     # Complete stage via experiment (runs tests — can be slow)
     metrics = await loop.run_in_executor(
@@ -1281,15 +1553,23 @@ async def _wait_for_new_pty(session: RunSession, old_gen: int, timeout: float = 
     Returns (new_fd, new_gen) or (None, old_gen) if no new PTY appeared.
     Timeout is generous because metrics collection between stages can be slow.
     """
-    if not session.auto_mode:
+    # Wait for a new PTY if we're in auto mode (stage auto-advance) or
+    # in a multi-phase protocol (phase auto-advance within a stage).
+    # Check phase_defs (not phase_index) to avoid races with _advance_phase.
+    in_multiphase = len(session.phase_defs) > 0
+    if not session.auto_mode and not in_multiphase:
         return None, old_gen
-    _harness_log(f"ws: waiting for new PTY (gen={old_gen}, timeout={timeout}s)", session)
+    _harness_log(f"ws: waiting for new PTY (gen={old_gen}, timeout={timeout}s, multiphase={in_multiphase})", session)
     deadline = time.time() + timeout
     while time.time() < deadline:
         await asyncio.sleep(0.3)
         if session.pty_generation > old_gen and session.pty_fd is not None:
             _harness_log(f"ws: PTY gen {old_gen} -> {session.pty_generation} (fd={session.pty_fd})", session)
             return session.pty_fd, session.pty_generation
+        # If phase state was reset, all phases are done — stop waiting
+        if in_multiphase and len(session.phase_defs) == 0:
+            _harness_log(f"ws: phases complete, no more PTYs expected (gen={old_gen})", session)
+            return None, old_gen
     _harness_log(f"ws: no new PTY after {timeout}s (gen={old_gen})", session)
     return None, old_gen
 
@@ -1402,6 +1682,31 @@ def _load_all_tasks():
 def get_logs():
     """Return all experiment logs with metrics (stripped of test_results)."""
     return {"runs": _load_all_logs()}
+
+
+@app.get("/api/log/{run_id:path}")
+def get_log_detail(run_id: str):
+    """Return full log detail for a single run (including denied_tool_calls, test_results)."""
+    logs_dir = Path("logs")
+    if not logs_dir.exists():
+        return {"error": "no logs directory"}
+    # run_id may contain slashes (e.g. task_name/run_id) — search by filename
+    for f in logs_dir.rglob("*.json"):
+        if f.name == "experiment_tree.json":
+            continue
+        if f.stem == run_id or f.stem in run_id or run_id in f.stem:
+            try:
+                with open(f) as fh:
+                    log = json.load(fh)
+                # Add effective_tokens if missing
+                for s in log.get("stages", []):
+                    if "effective_tokens" not in s:
+                        s["effective_tokens"] = _effective_tokens(s)
+                log["total_failure"] = _is_total_failure(log)
+                return {"log": log}
+            except (json.JSONDecodeError, KeyError):
+                return {"error": f"failed to parse {f}"}
+    return {"error": f"run_id '{run_id}' not found"}
 
 
 @app.get("/api/tasks")
@@ -1741,6 +2046,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .stage-proto-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
   .stage-proto-row .stage-label { font-size: 12px; color: #ccc; min-width: 90px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .stage-proto-row select { flex: 1; padding: 3px 4px; font-size: 11px; border-radius: 4px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; }
+  /* Run Logs tab */
+  .rl-container { display: flex; flex: 1; overflow: hidden; }
+  .rl-sidebar { width: 340px; background: #16213e; border-right: 1px solid #0f3460; overflow-y: auto; padding: 16px; flex-shrink: 0; }
+  .rl-main { flex: 1; padding: 20px; overflow-y: auto; }
+  .rl-run-item { padding: 8px 10px; margin-bottom: 4px; border-radius: 6px; font-size: 12px; cursor: pointer; border: 1px solid transparent; }
+  .rl-run-item:hover { background: #0f3460; }
+  .rl-run-item.selected { background: #0f3460; border-color: #e94560; }
+  .rl-run-title { font-weight: 600; color: #e0e0e0; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rl-run-meta { font-size: 11px; color: #888; }
+  .rl-card { background: #1a1a2e; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+  .rl-card-title { font-size: 14px; font-weight: 600; color: #e94560; margin-bottom: 10px; }
+  .rl-kv { display: flex; justify-content: space-between; padding: 3px 0; font-size: 13px; border-bottom: 1px solid #0f346030; }
+  .rl-kv .k { color: #888; }
+  .rl-kv .v { color: #e0e0e0; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .rl-denied-row { padding: 6px 8px; margin-bottom: 4px; background: #3b2020; border-radius: 4px; font-size: 12px; }
+  .rl-denied-tool { color: #fca5a5; font-weight: 600; }
+  .rl-denied-cmd { color: #e0e0e0; font-family: monospace; font-size: 11px; word-break: break-all; }
+  .rl-denied-meta { color: #888; font-size: 11px; margin-top: 2px; }
+  .rl-stage-tab { display: inline-block; padding: 4px 12px; font-size: 12px; border-radius: 4px 4px 0 0; cursor: pointer; color: #888; background: transparent; border: 1px solid transparent; border-bottom: none; margin-right: 2px; }
+  .rl-stage-tab:hover { color: #e0e0e0; }
+  .rl-stage-tab.active { color: #e94560; background: #1a1a2e; border-color: #0f3460; }
+  .rl-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-left: 6px; }
+  .rl-badge-ok { background: #1a3a2e; color: #4ade80; }
+  .rl-badge-warn { background: #3b3a20; color: #f59e0b; }
+  .rl-badge-err { background: #3b2020; color: #ef4444; }
+  .rl-test-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
+  .rl-test-pass { color: #4ade80; }
+  .rl-test-fail { color: #ef4444; }
+  .rl-filter-row { display: flex; gap: 6px; margin-bottom: 10px; }
+  .rl-filter-row input { flex: 1; padding: 5px 8px; border-radius: 6px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -1750,6 +2085,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </header>
 <div class="tab-bar">
   <button class="tab-btn active" onclick="switchTab('experiment')">Experiment</button>
+  <button class="tab-btn" onclick="switchTab('runlogs')">Run Logs</button>
   <button class="tab-btn" onclick="switchTab('visualizer')">Results Visualizer</button>
   <button class="tab-btn" onclick="switchTab('differential')">Differential Analysis</button>
   <button class="tab-btn" onclick="switchTab('pareto')">Pareto Analysis</button>
@@ -1820,6 +2156,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 </div><!-- end tab-experiment -->
+
+<!-- Tab: Run Logs -->
+<div id="tab-runlogs" class="tab-content">
+  <div class="rl-container">
+    <div class="rl-sidebar">
+      <div class="viz-label">Filter</div>
+      <div class="rl-filter-row">
+        <input type="text" id="rl-search" placeholder="Search runs..." oninput="rlFilterRuns()">
+      </div>
+      <div class="viz-label">Task</div>
+      <select class="viz-select" id="rl-task-filter" onchange="rlFilterRuns()">
+        <option value="">All Tasks</option>
+      </select>
+      <div class="viz-label">Runs</div>
+      <div id="rl-run-list" style="max-height:calc(100vh - 280px);overflow-y:auto;"></div>
+    </div>
+    <div class="rl-main" id="rl-detail">
+      <div class="rl-card"><div style="color:#888;font-size:13px;">Select a run from the sidebar to view details.</div></div>
+    </div>
+  </div>
+</div>
 
 <!-- Tab: Results Visualizer -->
 <div id="tab-visualizer" class="tab-content">
@@ -2079,7 +2436,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     if (tab) tab.classList.add('active');
     // Activate the button
     const buttons = document.querySelectorAll('.tab-btn');
-    const tabNames = ['experiment', 'visualizer', 'differential', 'pareto'];
+    const tabNames = ['experiment', 'runlogs', 'visualizer', 'differential', 'pareto'];
     const idx = tabNames.indexOf(tabId);
     if (idx >= 0 && buttons[idx]) buttons[idx].classList.add('active');
     // Resize terminal when switching back to experiment tab
@@ -2089,6 +2446,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // Load viz data when switching to visualizer or differential
     if (tabId === 'visualizer' || tabId === 'differential' || tabId === 'pareto') {
       loadVizData();
+    }
+    if (tabId === 'runlogs') {
+      rlLoadRuns();
     }
   }
 
@@ -3885,7 +4245,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // For accuracy metrics, store as error rate (1 - acc).
     const binProtoVals = {}; // binKey -> { proto -> [values across runs] }
     runs.forEach(r => {
-      const task = (r.task || '').replace(/\/$/, '');
+      const task = (r.task || '').replace(/\\/$/, '');
       (r.stages || []).forEach(s => {
         if (!paretoStagePassesFilter(s, stageFilterVal)) return;
         const raw = s[metric];
@@ -4213,6 +4573,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     };
 
+    // Compute axis ranges: expand to fit error ellipses, but rubber-band
+    // so data points always span at least 50% of each axis (25%-75% of range).
+    function computeAxisRange(points, getVal, getSE) {
+      const vals = points.map(getVal);
+      const dataMin = Math.min(...vals);
+      const dataMax = Math.max(...vals);
+      const dataSpan = dataMax - dataMin || 1e-6;
+
+      // Ellipse extents
+      let ellipseMin = dataMin, ellipseMax = dataMax;
+      points.forEach(p => {
+        const v = getVal(p), se = getSE(p);
+        if (se > 0) {
+          ellipseMin = Math.min(ellipseMin, v - se);
+          ellipseMax = Math.max(ellipseMax, v + se);
+        }
+      });
+
+      // Max allowed range: data occupies 50% (sits at 25%-75%)
+      const maxSpan = dataSpan / 0.5;
+      const dataMid = (dataMin + dataMax) / 2;
+
+      // Start from data range, expand to fit ellipses, but cap at maxSpan
+      let lo = ellipseMin, hi = ellipseMax;
+      const ellipseSpan = hi - lo;
+      if (ellipseSpan > maxSpan) {
+        // Clamp: center on data midpoint with maxSpan
+        lo = dataMid - maxSpan / 2;
+        hi = dataMid + maxSpan / 2;
+      }
+      // Add a small margin (5%) for visual breathing room
+      const margin = (hi - lo) * 0.05;
+      return { min: lo - margin, max: hi + margin };
+    }
+
+    const xSEof = p => p.xN >= 2 ? p.xStd / Math.sqrt(p.xN) : 0;
+    const ySEof = p => p.yN >= 2 ? p.yStd / Math.sqrt(p.yN) : 0;
+    const xRange = computeAxisRange(points, p => p.x, xSEof);
+    const yRange = computeAxisRange(points, p => p.y, ySEof);
+
     const ctx = document.getElementById('pareto-chart').getContext('2d');
     if (paretoChart) paretoChart.destroy();
 
@@ -4266,10 +4666,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         },
         scales: {
           x: {
+            min: xRange.min, max: xRange.max,
             title: { display: true, text: xLabel + (xDir === 'lower' ? ' (lower is better)' : ' (higher is better)'), color: '#888' },
             ticks: { color: '#888' }, grid: { color: '#0f3460' },
           },
           y: {
+            min: yRange.min, max: yRange.max,
             title: { display: true, text: yLabel + (yDir === 'higher' ? ' (higher is better)' : ' (lower is better)'), color: '#888' },
             ticks: { color: '#888' }, grid: { color: '#0f3460' },
           },
@@ -4289,6 +4691,269 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     document.getElementById('pareto-info').textContent = info;
   }
 
+  // ── Run Logs tab ──────────────────────────────────────────────────
+  let rlRunsCache = null;
+  let rlSelectedRunId = null;
+
+  async function rlLoadRuns() {
+    try {
+      const res = await fetch('/api/logs');
+      const data = await res.json();
+      rlRunsCache = (data.runs || []).sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+      rlPopulateTaskFilter();
+      rlFilterRuns();
+    } catch(e) {
+      console.error('Failed to load run logs:', e);
+    }
+  }
+
+  function rlPopulateTaskFilter() {
+    const sel = document.getElementById('rl-task-filter');
+    const tasks = new Set();
+    for (const r of rlRunsCache || []) {
+      const t = rlTaskName(r);
+      if (t) tasks.add(t);
+    }
+    sel.innerHTML = '<option value="">All Tasks</option>';
+    for (const t of [...tasks].sort()) {
+      sel.innerHTML += `<option value="${t}">${t}</option>`;
+    }
+  }
+
+  function rlTaskName(run) {
+    const t = run.task || '';
+    const m = t.match(/tasks\\/([^/]+)/);
+    return m ? m[1] : t.split('/').pop() || t;
+  }
+
+  function rlFilterRuns() {
+    const query = (document.getElementById('rl-search').value || '').toLowerCase();
+    const taskFilter = document.getElementById('rl-task-filter').value;
+    const list = document.getElementById('rl-run-list');
+    if (!rlRunsCache) { list.innerHTML = '<div style="color:#666;font-size:12px;">Loading...</div>'; return; }
+
+    const filtered = rlRunsCache.filter(r => {
+      if (taskFilter && rlTaskName(r) !== taskFilter) return false;
+      if (query) {
+        const hay = (r.run_id + ' ' + r.protocol + ' ' + r.model + ' ' + r.task + ' ' + (r.timestamp || '')).toLowerCase();
+        if (!hay.includes(query)) return false;
+      }
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      list.innerHTML = '<div style="color:#666;font-size:12px;">No runs found.</div>';
+      return;
+    }
+
+    list.innerHTML = filtered.map(r => {
+      const nStages = (r.stages || []).length;
+      const totalDenied = (r.denied_tool_calls_summary || {}).total || 0;
+      const ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : '';
+      const sel = r.run_id === rlSelectedRunId ? ' selected' : '';
+      const deniedBadge = totalDenied > 0 ? `<span class="rl-badge rl-badge-err">${totalDenied} denied</span>` : '';
+      const failBadge = r.total_failure ? '<span class="rl-badge rl-badge-err">FAIL</span>' : '';
+      return `<div class="rl-run-item${sel}" onclick="rlSelectRun('${r.run_id}')">
+        <div class="rl-run-title">${r.run_id}${failBadge}${deniedBadge}</div>
+        <div class="rl-run-meta">${rlTaskName(r)} · ${r.protocol || '?'} · ${r.model || '?'} · ${nStages} stages · ${ts}</div>
+      </div>`;
+    }).join('');
+  }
+
+  async function rlSelectRun(runId) {
+    rlSelectedRunId = runId;
+    rlFilterRuns(); // re-render to update selection highlight
+    const detail = document.getElementById('rl-detail');
+    detail.innerHTML = '<div class="rl-card"><div style="color:#888;">Loading...</div></div>';
+
+    try {
+      const res = await fetch('/api/log/' + encodeURIComponent(runId));
+      const data = await res.json();
+      if (data.error) {
+        detail.innerHTML = `<div class="rl-card"><div style="color:#ef4444;">Error: ${data.error}</div></div>`;
+        return;
+      }
+      rlRenderDetail(data.log);
+    } catch(e) {
+      detail.innerHTML = `<div class="rl-card"><div style="color:#ef4444;">Failed to load: ${e}</div></div>`;
+    }
+  }
+
+  function rlRenderDetail(log) {
+    const detail = document.getElementById('rl-detail');
+    let html = '';
+
+    // Run summary card
+    const nStages = (log.stages || []).length;
+    const totalTokens = (log.stages || []).reduce((s, st) => s + (st.total_tokens || 0), 0);
+    const totalWall = (log.stages || []).reduce((s, st) => s + (st.wall_time_seconds || 0), 0);
+    html += `<div class="rl-card">
+      <div class="rl-card-title">Run Summary</div>
+      <div class="rl-kv"><span class="k">Run ID</span><span class="v">${log.run_id || ''}</span></div>
+      <div class="rl-kv"><span class="k">Task</span><span class="v">${rlTaskName(log)}</span></div>
+      <div class="rl-kv"><span class="k">Protocol</span><span class="v">${log.protocol || ''}</span></div>
+      <div class="rl-kv"><span class="k">Model</span><span class="v">${log.model || ''}</span></div>
+      <div class="rl-kv"><span class="k">Timestamp</span><span class="v">${log.timestamp || ''}</span></div>
+      <div class="rl-kv"><span class="k">Stages</span><span class="v">${nStages}</span></div>
+      <div class="rl-kv"><span class="k">Total Tokens</span><span class="v">${totalTokens.toLocaleString()}</span></div>
+      <div class="rl-kv"><span class="k">Total Wall Time</span><span class="v">${formatDuration(totalWall)}</span></div>
+    </div>`;
+
+    // Denied tool calls summary
+    const ds = log.denied_tool_calls_summary;
+    if (ds && ds.total > 0) {
+      html += `<div class="rl-card">
+        <div class="rl-card-title">Denied Tool Calls (${ds.total} total, ${ds.unique} unique)</div>`;
+      for (const d of (ds.top || [])) {
+        const stages = (d.stages || []).join(', ');
+        html += `<div class="rl-denied-row">
+          <span class="rl-denied-tool">[${d.tool}]</span>
+          <span class="rl-denied-cmd"> ${rlEsc(d.command)}</span>
+          <span class="rl-badge rl-badge-warn">x${d.count}</span>
+          <div class="rl-denied-meta">Stages: ${stages}</div>
+        </div>`;
+      }
+      html += '</div>';
+    }
+
+    // Per-stage details
+    if (log.stages && log.stages.length > 0) {
+      html += '<div class="rl-card"><div class="rl-card-title">Stage Details</div>';
+      // Stage tabs
+      html += '<div style="border-bottom:1px solid #0f3460;margin-bottom:12px;">';
+      log.stages.forEach((st, i) => {
+        const active = i === 0 ? ' active' : '';
+        const label = st.stage_id || `Stage ${i+1}`;
+        const denied = (st.denied_tool_calls || []).length;
+        const badge = denied > 0 ? `<span class="rl-badge rl-badge-err">${denied}</span>` : '';
+        html += `<span class="rl-stage-tab${active}" onclick="rlSwitchStage(${i})" id="rl-stage-tab-${i}">${label}${badge}</span>`;
+      });
+      html += '</div>';
+
+      // Stage panels
+      log.stages.forEach((st, i) => {
+        const vis = i === 0 ? '' : 'display:none;';
+        html += `<div id="rl-stage-panel-${i}" style="${vis}">`;
+        html += rlRenderStage(st);
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+
+    detail.innerHTML = html;
+  }
+
+  function rlSwitchStage(idx) {
+    document.querySelectorAll('[id^="rl-stage-tab-"]').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('[id^="rl-stage-panel-"]').forEach(el => el.style.display = 'none');
+    const tab = document.getElementById('rl-stage-tab-' + idx);
+    const panel = document.getElementById('rl-stage-panel-' + idx);
+    if (tab) tab.classList.add('active');
+    if (panel) panel.style.display = '';
+  }
+
+  function rlRenderStage(st) {
+    let html = '';
+
+    // Metrics
+    const trainAcc = st.training_tests_total ? (st.training_tests_passed / st.training_tests_total * 100).toFixed(0) + '%' : '--';
+    const holdAcc = st.holdout_tests_total ? (st.holdout_tests_passed / st.holdout_tests_total * 100).toFixed(0) + '%' : '--';
+    html += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;margin-bottom:12px;">
+      <div class="rl-kv"><span class="k">Training</span><span class="v">${st.training_tests_passed || 0}/${st.training_tests_total || 0} (${trainAcc})</span></div>
+      <div class="rl-kv"><span class="k">Holdout</span><span class="v">${st.holdout_tests_passed || 0}/${st.holdout_tests_total || 0} (${holdAcc})</span></div>
+      <div class="rl-kv"><span class="k">Regression Failures</span><span class="v">${st.regression_tests_failed || 0}/${st.regression_tests_total || 0}</span></div>
+      <div class="rl-kv"><span class="k">Perf Tests</span><span class="v">${st.perf_tests_passed || 0}/${st.perf_tests_total || 0}</span></div>
+      <div class="rl-kv"><span class="k">Tokens</span><span class="v">${(st.total_tokens || 0).toLocaleString()}</span></div>
+      <div class="rl-kv"><span class="k">Effective Tokens</span><span class="v">${(st.effective_tokens || 0).toLocaleString()}</span></div>
+      <div class="rl-kv"><span class="k">Wall Time</span><span class="v">${formatDuration(st.wall_time_seconds)}</span></div>
+      <div class="rl-kv"><span class="k">Human Time</span><span class="v">${formatDuration(st.human_time_seconds)}</span></div>
+      <div class="rl-kv"><span class="k">Code Lines</span><span class="v">${(st.code_lines || 0).toLocaleString()}</span></div>
+      <div class="rl-kv"><span class="k">Code Bytes</span><span class="v">${(st.code_bytes || 0).toLocaleString()}</span></div>
+    </div>`;
+
+    // Token breakdown
+    if (st.input_tokens || st.output_tokens || st.cache_read_tokens) {
+      html += `<div style="font-size:11px;color:#888;margin-bottom:12px;">
+        Input: ${(st.input_tokens||0).toLocaleString()} · Output: ${(st.output_tokens||0).toLocaleString()} · Cache read: ${(st.cache_read_tokens||0).toLocaleString()} · Cache write: ${(st.cache_creation_tokens||0).toLocaleString()}
+      </div>`;
+    }
+
+    // Phase breakdown
+    if (st.phase_breakdown && st.phase_breakdown.length > 0) {
+      html += '<div style="margin-bottom:12px;"><div style="font-size:12px;font-weight:600;color:#e94560;margin-bottom:6px;">Phase Breakdown</div>';
+      for (const p of st.phase_breakdown) {
+        html += `<div class="rl-kv"><span class="k">${p.phase_name || '?'}</span><span class="v">${(p.total_tokens||0).toLocaleString()} tokens, ${formatDuration(p.wall_time_seconds)}</span></div>`;
+      }
+      html += '</div>';
+    }
+
+    // Denied tool calls for this stage
+    const denied = st.denied_tool_calls || [];
+    if (denied.length > 0) {
+      html += `<div style="margin-bottom:12px;"><div style="font-size:12px;font-weight:600;color:#fca5a5;margin-bottom:6px;">Denied Tool Calls (${denied.length})</div>`;
+      // Deduplicate
+      const seen = new Map();
+      for (const d of denied) {
+        const key = d.tool + ':' + (d.input_summary || '').substring(0, 60);
+        if (seen.has(key)) { seen.get(key).count++; }
+        else { seen.set(key, {...d, count: 1}); }
+      }
+      for (const d of seen.values()) {
+        html += `<div class="rl-denied-row">
+          <span class="rl-denied-tool">[${d.tool}]</span>
+          <span class="rl-denied-cmd"> ${rlEsc(d.input_summary || '')}</span>
+          ${d.count > 1 ? `<span class="rl-badge rl-badge-warn">x${d.count}</span>` : ''}
+          <div class="rl-denied-meta">${rlEsc((d.error || '').substring(0, 150))}</div>
+        </div>`;
+      }
+      html += '</div>';
+    }
+
+    // Warnings
+    if (st.warnings && st.warnings.length > 0) {
+      html += `<div style="margin-bottom:12px;"><div style="font-size:12px;font-weight:600;color:#f59e0b;margin-bottom:6px;">Warnings (${st.warnings.length})</div>`;
+      for (const w of st.warnings) {
+        html += `<div style="font-size:12px;color:#f59e0b;padding:2px 0;">${rlEsc(typeof w === 'string' ? w : JSON.stringify(w))}</div>`;
+      }
+      html += '</div>';
+    }
+
+    // Spontaneous behaviors
+    if (st.spontaneous_behaviors && st.spontaneous_behaviors.length > 0) {
+      html += `<div style="margin-bottom:12px;"><div style="font-size:12px;font-weight:600;color:#6366f1;margin-bottom:6px;">Spontaneous Behaviors (${st.spontaneous_behaviors.length})</div>`;
+      for (const b of st.spontaneous_behaviors) {
+        html += `<div style="font-size:12px;color:#ccc;padding:2px 0;">[${b.type}] ${rlEsc(b.detail || '')}</div>`;
+        for (const f of (b.files || [])) {
+          html += `<div style="font-size:11px;color:#888;padding-left:16px;">${rlEsc(f)}</div>`;
+        }
+      }
+      html += '</div>';
+    }
+
+    // Test results
+    if (st.test_results && st.test_results.length > 0) {
+      html += `<div style="margin-bottom:12px;"><div style="font-size:12px;font-weight:600;color:#e94560;margin-bottom:6px;">Test Results</div>`;
+      for (const t of st.test_results) {
+        const icon = t.passed ? '<span class="rl-test-pass">PASS</span>' : '<span class="rl-test-fail">FAIL</span>';
+        const name = rlEsc(t.name || t.nodeid || '?');
+        html += `<div class="rl-test-row">${icon} <span style="color:#ccc;">${name}</span></div>`;
+        if (!t.passed && t.message) {
+          html += `<div style="font-size:11px;color:#888;padding-left:60px;white-space:pre-wrap;max-height:80px;overflow-y:auto;">${rlEsc(t.message.substring(0, 500))}</div>`;
+        }
+      }
+      html += '</div>';
+    }
+
+    return html;
+  }
+
+  function rlEsc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────
   // Init — load protocols first since buildStageProtocolList needs protocolsData
   initTerminal();
   loadProtocols().then(() => loadTasks());

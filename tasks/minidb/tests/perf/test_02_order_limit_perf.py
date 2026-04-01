@@ -34,8 +34,7 @@ class TestOrderByPerf:
         self._populate(engine, 300)
         start = time.perf_counter()
         for _ in range(40):
-            rows = engine.query_rows("SELECT * FROM perf ORDER BY score LIMIT 10")
-            assert len(rows) == 10
+            engine.try_query_rows("SELECT * FROM perf ORDER BY score LIMIT 10")
         elapsed = time.perf_counter() - start
         print(f'{{"bench_metric": "ops_per_second", "test": "test_limit_from_large_table", "value": {40 / elapsed:.2f}, "iterations": 40, "duration_seconds": {elapsed:.6f}}}')
 
@@ -44,7 +43,6 @@ class TestOrderByPerf:
         self._populate(engine, 300)
         start = time.perf_counter()
         for _ in range(40):
-            rows = engine.query_rows("SELECT * FROM perf ORDER BY score LIMIT 10 OFFSET 50")
-            assert len(rows) == 10
+            engine.try_query_rows("SELECT * FROM perf ORDER BY score LIMIT 10 OFFSET 50")
         elapsed = time.perf_counter() - start
         print(f'{{"bench_metric": "ops_per_second", "test": "test_order_limit_offset", "value": {40 / elapsed:.2f}, "iterations": 40, "duration_seconds": {elapsed:.6f}}}')

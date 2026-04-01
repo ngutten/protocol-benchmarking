@@ -11,7 +11,7 @@ import time
 import pytest
 
 
-ENGINE_CMD_ENV = "MINIDB_ENGINE_CMD"
+ENGINE_CMD_ENV = "ENGINE_CMD"
 DEFAULT_ENGINE_CMD = "python3 minidb.py"
 
 
@@ -61,6 +61,23 @@ class MiniDBEngine:
         cols, rows = self.query(sql)
         assert len(rows) == 1 and len(rows[0]) == 1, \
             f"Expected scalar, got {len(rows)} rows x {len(cols)} cols"
+        return rows[0][0]
+
+    def try_query_rows(self, sql):
+        """Send a SELECT query, return just the rows. Returns [] on error (for perf tests)."""
+        resp = self.send(sql)
+        if "error" in resp:
+            return []
+        return resp.get("rows", [])
+
+    def try_query_scalar(self, sql):
+        """Send a query expected to return a single value. Returns None on error (for perf tests)."""
+        resp = self.send(sql)
+        if "error" in resp:
+            return None
+        rows = resp.get("rows", [])
+        if not rows or not rows[0]:
+            return None
         return rows[0][0]
 
     def expect_error(self, command, substring=None):

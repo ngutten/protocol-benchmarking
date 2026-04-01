@@ -4,7 +4,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from .token_usage import parse_claude_json_output, get_session_token_usage, get_denied_tool_calls
+from .token_usage import parse_claude_json_output, get_session_token_usage, get_subagent_token_usage, get_denied_tool_calls
 
 
 def _build_base_cmd(protocol, permission_mode="acceptEdits"):
@@ -72,11 +72,28 @@ def _run_claude_p(cmd, work_dir, timeout=None):
 
 
 def _backfill_usage(parsed):
-    """If JSON output had no usage, try session JSONL as fallback."""
-    if parsed["total_tokens"] == 0 and parsed.get("session_id"):
-        session_usage = get_session_token_usage(parsed["session_id"])
+    """Backfill token usage from session JSONL and add sub-agent tokens.
+
+    If the JSON output had no usage, fall back to the full session JSONL
+    (which already includes sub-agents).  Otherwise, supplement the
+    JSON-reported parent usage with any sub-agent token usage, since
+    sub-agents spawned via the Agent tool are tracked in separate session
+    files that aren't included in the parent's JSON output.
+    """
+    sid = parsed.get("session_id")
+    if not sid:
+        return
+
+    if parsed["total_tokens"] == 0:
+        # No usage from JSON output — get everything from session JSONL
+        session_usage = get_session_token_usage(sid)
         if session_usage["total_tokens"] > 0:
             parsed.update(session_usage)
+    else:
+        # JSON output has parent usage — add sub-agent tokens on top
+        sub_usage = get_subagent_token_usage(sid)
+        if sub_usage["total_tokens"] > 0:
+            _merge_token_data(parsed, sub_usage)
 
 
 def _merge_token_data(a, b):
@@ -329,8 +346,8 @@ def run_headless(work_dir, prompt, protocol, timeout=None):
         return combined
 
     elif protocol.planning_phase and protocol.planning_prompt:
-        # --- Phase 1: Planning (read-only) ---
-        plan_cmd = _build_base_cmd(protocol, permission_mode="plan")
+        # --- Phase 1: Planning (writes PLAN.md) ---
+        plan_cmd = _build_base_cmd(protocol, permission_mode="acceptEdits")
         plan_cmd.extend(["-p", protocol.planning_prompt])
 
         plan_parsed, plan_wall = _run_claude_p(plan_cmd, work_dir, timeout=timeout)
@@ -347,13 +364,9 @@ def run_headless(work_dir, prompt, protocol, timeout=None):
             combined["denied_tool_calls"] = _collect_denied(all_session_ids)
             return combined
 
-        # Store plan result for context (the CLAUDE.md already has the plan prompt,
-        # and Claude will see the planning output in its session history if we resume,
-        # but since we're doing a fresh -p call, we embed the plan in the prompt)
-        plan_result = plan_parsed.get("result", "")
-
         # --- Phase 2: Implementation (with edits) ---
-        impl_prompt = f"Here is the plan from the planning phase:\n\n{plan_result}\n\n{prompt}"
+        # The planning phase writes PLAN.md; the implementation phase reads it.
+        impl_prompt = f"Read PLAN.md for the implementation plan, then implement it.\n\n{prompt}"
         impl_cmd = _build_base_cmd(protocol, permission_mode="acceptEdits")
         impl_cmd.extend(["-p", impl_prompt])
 
@@ -437,10 +450,13 @@ def run_interactive(work_dir, prompt, protocol, session_id=None):
         "cache_creation_tokens": 0,
     }
 
+    denied = get_denied_tool_calls(sid) if sid else []
+
     return {
         "session_id": sid,
         "result": "interactive_session",
         "is_error": False,
         "wall_time_seconds": wall_time,
+        "denied_tool_calls": denied,
         **usage,
     }

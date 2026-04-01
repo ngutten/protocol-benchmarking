@@ -16,8 +16,8 @@ import pytest
 # We parse the workspace path and add it to sys.path so tests can
 #   `from cellautomata import Simulation`.
 # ---------------------------------------------------------------------------
-ENGINE_CMD_ENV = "CELLAUTOMATA_ENGINE_CMD"
-_engine_cmd = os.environ.get(ENGINE_CMD_ENV, os.environ.get("MINIDB_ENGINE_CMD", ""))
+ENGINE_CMD_ENV = "ENGINE_CMD"
+_engine_cmd = os.environ.get(ENGINE_CMD_ENV, "")
 if _engine_cmd and "cd " in _engine_cmd:
     _workspace = _engine_cmd.split("&&")[0].replace("cd ", "").strip()
     sys.path.insert(0, _workspace)

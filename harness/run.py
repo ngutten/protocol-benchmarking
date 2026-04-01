@@ -77,6 +77,8 @@ def run_stage(exp, stage_id, mode, protocol, timeout, special_stage=None, stage_
             "total_tokens": result["total_tokens"],
             "cache_read_tokens": result["cache_read_tokens"],
             "cache_creation_tokens": result["cache_creation_tokens"],
+            "denied_tool_calls": result.get("denied_tool_calls", []),
+            "phase_breakdown": result.get("phase_breakdown", []),
         }
         if result["is_error"]:
             print(f"  WARNING: Claude returned error: {result['result'][:200]}")
@@ -91,6 +93,7 @@ def run_stage(exp, stage_id, mode, protocol, timeout, special_stage=None, stage_
             "total_tokens": result["total_tokens"],
             "cache_read_tokens": result["cache_read_tokens"],
             "cache_creation_tokens": result["cache_creation_tokens"],
+            "denied_tool_calls": result.get("denied_tool_calls", []),
         }
 
     else:  # manual

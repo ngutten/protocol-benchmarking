@@ -1,0 +1,48 @@
+name: pdesolver
+title: PDE Solver
+description: >
+  A progressive benchmark for building a two-dimensional partial differential
+  equation solver. Starts as a Python library for the heat equation on a
+  square grid with multiple boundary condition types, and grows to support
+  multiple fields and general nonlinear PDEs.
+
+engine_cmd: "python3 -c 'import pdesolver'"
+
+domain_tags:
+  - numerical-methods
+  - scientific-computing
+  - pde
+  - physics-simulation
+
+stages:
+  - id: diffusion
+    spec: stages/01_diffusion.md
+    type: feature_addition
+    training_tests: tests/training/test_01_diffusion.py
+    holdout_tests: tests/holdout/test_01_diffusion_holdout.py
+    perf_tests: tests/perf/test_01_diffusion_perf.py
+
+  - id: multifield
+    spec: stages/02_multifield.md
+    type: feature_addition
+    training_tests: tests/training/test_02_multifield.py
+    holdout_tests: tests/holdout/test_02_multifield_holdout.py
+    perf_tests: tests/perf/test_02_multifield_perf.py
+
+  - id: general_pde
+    spec: stages/03_general_pde.md
+    type: feature_addition
+    training_tests: tests/training/test_03_general_pde.py
+    holdout_tests: tests/holdout/test_03_general_pde_holdout.py
+    perf_tests: tests/perf/test_03_general_pde_perf.py
+
+pipelines:
+  sequential_full:
+    stages: [diffusion, multifield, general_pde]
+    differential: sequential
+
+  sequential_diff_12:
+    stages:
+      - {stage: diffusion, slot: A}
+      - {stage: multifield, slot: B}
+    differential: sequential

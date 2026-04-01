@@ -34,6 +34,8 @@ class GitManager:
         return self._run("rev-parse", "HEAD")
 
     def tag(self, name):
+        if self.tag_exists(name):
+            self._run("tag", "-d", name)
         self._run("tag", name)
 
     def branch(self, name):

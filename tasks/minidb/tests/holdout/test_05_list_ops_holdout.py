@@ -37,14 +37,7 @@ class TestFlattenEdge:
         assert rows == [[2, 10]]
 
     def test_flatten_with_group_by(self, engine):
-        engine.execute("CREATE TABLE t (grp, items)")
-        engine.execute("INSERT INTO t VALUES ('a', [1, 2, 3])")
-        engine.execute("INSERT INTO t VALUES ('b', [4, 5])")
-        rows = engine.query_rows(
-            "SELECT grp, COUNT(*) FROM (SELECT grp, FLATTEN(items) AS item FROM t) GROUP BY grp ORDER BY grp"
-        )
-        # Hmm, subqueries aren't in scope. Let me do this differently.
-        # FLATTEN + GROUP BY on the flattened column
+        """FLATTEN + GROUP BY on the flattened column."""
         engine.execute("CREATE TABLE t2 (id, tags)")
         engine.execute("INSERT INTO t2 VALUES (1, ['a', 'b'])")
         engine.execute("INSERT INTO t2 VALUES (2, ['a', 'c'])")

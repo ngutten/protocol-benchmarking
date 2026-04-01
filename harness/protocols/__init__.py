@@ -87,6 +87,18 @@ DEFAULT_ALLOWED_TOOLS = [
     "Bash(grep *)",
     "Bash(rg *)",
     "Bash(xargs *)",
+    # Package / system queries (read-only discovery)
+    "Bash(apt list *)",
+    "Bash(apt show *)",
+    "Bash(apt-cache *)",
+    "Bash(dpkg -l *)",
+    "Bash(dpkg -L *)",
+    "Bash(dpkg -s *)",
+    "Bash(dpkg -S *)",
+    "Bash(dpkg-query *)",
+    "Bash(pkg-config *)",
+    "Bash(ldconfig -p *)",
+    "Bash(ldd *)",
 ]
 
 # Tools that require explicit protocol opt-in

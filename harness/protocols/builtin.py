@@ -83,10 +83,11 @@ PLAN_AND_IMPLEMENT = ProtocolDef(
     provides_spec=True,
     provides_training_tests=True,
     planning_phase=True,
-    planning_prompt="Read the following specification carefully. Draft an implementation "
-        "plan that describes: (1) what data structures you will use, (2) what the main "
-        "code changes are, (3) what edge cases you anticipate. Do NOT write any code yet.",
-    added_instructions="Now implement according to your plan. Tests are in tests/.",
+    planning_prompt="Read the following specification carefully. Write an implementation "
+        "plan to PLAN.md that describes: (1) what data structures you will use, (2) what the main "
+        "code changes are, (3) what edge cases you anticipate. Do NOT write any code yet — "
+        "only write the plan to PLAN.md.",
+    added_instructions="Read PLAN.md, then implement according to the plan. Tests are in tests/.",
 )
 
 HUMAN_SUPERVISED = ProtocolDef(
@@ -118,14 +119,14 @@ SEQUENTIAL_PIPELINE = ProtocolDef(
         PhaseDef(
             name="implement",
             prompt_template="Read PLAN.md and CURRENT_STAGE.md. Implement the plan. "
-                "Run tests in tests/ and iterate until they pass.",
+                "Do NOT read any tests, write any tests, or run any tests of the code at this point!",
             permission_mode="acceptEdits",
         ),
         PhaseDef(
             name="review",
-            prompt_template="Review the implementation against CURRENT_STAGE.md. "
+            prompt_template="Review the implementation against CURRENT_STAGE.md, and check it against the tests in tests/"
                 "Write a critique to REVIEW.md with specific bugs and improvements. "
-                "Do NOT modify implementation code.",
+                "Do NOT modify implementation code or iterate against the tests.",
             permission_mode="acceptEdits",
         ),
         PhaseDef(
@@ -169,6 +170,28 @@ PLAN_PARALLEL_IMPLEMENT = ProtocolDef(
     ],
 )
 
+COMPRESSED_ADVERSARIAL = ProtocolDef(
+    name="compressed_adversarial",
+    description="2-phase: plan+(sub-implement) -> review+fix, each fresh context.",
+    provides_spec=True,
+    provides_training_tests=True,
+    phases=[
+        PhaseDef(
+            name="plan_implement",
+            prompt_template="Read CURRENT_STAGE.md. First plan out how you will do this then implement the plan using sub-agents. "
+				"When iterating against the tests in tests/, use sub-agents to do so and have them report back. "
+				"Keep actual coding out of your context as much as possible.",
+            permission_mode="acceptEdits",
+        ),
+        PhaseDef(
+            name="review_fix",
+            prompt_template="Review the implementation against CURRENT_STAGE.md, and check it against the tests in tests/"
+                "Spawn sub-agents to fix any bugs or problems you find.",
+            permission_mode="acceptEdits",
+        ),
+    ],
+)
+
 PROTOCOLS = [
     DIRECT_NO_TESTS,
     DIRECT_SPEED,
@@ -180,4 +203,5 @@ PROTOCOLS = [
     HUMAN_SUPERVISED,
     SEQUENTIAL_PIPELINE,
     PLAN_PARALLEL_IMPLEMENT,
+    COMPRESSED_ADVERSARIAL
 ]

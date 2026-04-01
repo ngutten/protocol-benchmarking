@@ -8,9 +8,11 @@ Supports pipeline-driven execution with per-stage protocol slots,
 special stage types (translate/refactor/removal), and git-based forking
 from existing experiment states.
 """
+import copy
 import json
 import os
 import time
+import shlex
 import shutil
 import yaml
 from datetime import datetime
@@ -65,6 +67,7 @@ def generate_claude_md(stage_id: str, protocol: ProtocolDef, has_full_spec: bool
                 lines.append(f"  - `stages/{sf}`{marker}")
         else:
             lines.append("- Read `CURRENT_STAGE.md` for the current stage requirements.")
+        lines.append("- If a `reference/` directory exists, it contains architecture and design documents relevant across all stages.")
         lines.append("")
 
     if protocol.provides_training_tests:
@@ -124,6 +127,11 @@ def setup_run_directory(run_id: str, task_dir: str, protocol: ProtocolDef) -> di
             for f in stages_src.iterdir():
                 if f.suffix == ".md":
                     shutil.copy2(f, stages_dest / f.name)
+
+    # Copy reference documents
+    reference_src = task_dir / "reference"
+    if reference_src.is_dir():
+        shutil.copytree(reference_src, workspace / "reference", dirs_exist_ok=True)
 
     return {
         "workspace": str(workspace),
@@ -245,6 +253,15 @@ class Experiment:
         else:
             self.engine_cmd = engine_cmd
 
+        # Inject engine_cmd-derived tool permissions so the headless Claude
+        # instance (and interactive settings.local.json) can run the task
+        # binary without hitting approval prompts.  We copy the protocol to
+        # avoid mutating the shared singleton in ALL_PROTOCOLS.
+        engine_patterns = self._engine_tool_patterns(self.engine_cmd)
+        if engine_patterns:
+            self.protocol = copy.deepcopy(self.protocol)
+            self.protocol.extra_allowed_tools.extend(engine_patterns)
+
         self.completed_stages = []
         self.all_metrics = []
         self.git = None
@@ -289,12 +306,16 @@ class Experiment:
         """Resolve per-stage protocols from pipeline slot assignments."""
         if not self.pipeline_stages:
             return
+        engine_patterns = self._engine_tool_patterns(self.engine_cmd)
         for ps in self.pipeline_stages:
             slot = ps.get("slot")
             if slot and slot in self.slots:
                 proto_name = self.slots[slot]
                 if proto_name in ALL_PROTOCOLS:
-                    self._stage_protocols[ps["stage_id"]] = ALL_PROTOCOLS[proto_name]
+                    proto = copy.deepcopy(ALL_PROTOCOLS[proto_name])
+                    if engine_patterns:
+                        proto.extra_allowed_tools.extend(engine_patterns)
+                    self._stage_protocols[ps["stage_id"]] = proto
 
     def get_protocol_for_stage(self, stage_id: str) -> ProtocolDef:
         """Get the protocol to use for a given stage (supports per-stage overrides)."""
@@ -318,6 +339,52 @@ class Experiment:
                     result.append(ps["stage_id"])
             return result
         return list(self.stages)
+
+    @staticmethod
+    def _engine_tool_patterns(engine_cmd: str) -> list:
+        """Derive Bash tool permission patterns from an engine_cmd string.
+
+        For a command like ``./build/test_harness``, returns patterns that
+        allow Claude to invoke the binary directly or as part of a pipeline
+        (e.g. ``printf '...' | ./build/test_harness``).
+
+        Commands whose first token is already covered by DEFAULT_ALLOWED_TOOLS
+        (python3, python, node, cargo, go, etc.) are skipped to avoid
+        redundant entries.
+        """
+        if not engine_cmd:
+            return []
+
+        # Parse the first token (the binary) from the engine_cmd
+        try:
+            parts = shlex.split(engine_cmd)
+        except ValueError:
+            parts = engine_cmd.split()
+        if not parts:
+            return []
+
+        binary = parts[0]
+
+        # Binaries already covered by DEFAULT_ALLOWED_TOOLS
+        _ALREADY_ALLOWED = {
+            "python3", "python", "pytest", "node", "npx", "cargo", "rustc",
+            "go", "gcc", "g++", "cc", "c++", "make", "cmake", "tsc",
+        }
+        if binary in _ALREADY_ALLOWED:
+            return []
+
+        # Allow both bare invocation and with arguments
+        patterns = [f"Bash({engine_cmd})", f"Bash({engine_cmd} *)"]
+
+        # Also allow the bare basename (e.g. ./test_harness when engine_cmd
+        # is ./build/test_harness) since agents may copy or symlink the
+        # binary into the working directory.
+        basename = os.path.basename(binary)
+        bare = f"./{basename}"
+        if bare != binary:
+            patterns.extend([f"Bash({bare})", f"Bash({bare} *)"])
+
+        return patterns
 
     def _write_workspace_settings(self):
         """Create .claude/settings.local.json in the workspace.
@@ -386,6 +453,11 @@ class Experiment:
             assets_src = self.task_dir / "assets"
             if assets_src.is_dir():
                 shutil.copytree(assets_src, self.work_dir / "assets", dirs_exist_ok=True)
+
+            # Copy reference documents (architecture specs, keyboard refs, etc.)
+            reference_src = self.task_dir / "reference"
+            if reference_src.is_dir():
+                shutil.copytree(reference_src, self.work_dir / "reference", dirs_exist_ok=True)
 
             self.git.commit_all("Initial: empty workspace")
 
@@ -500,7 +572,20 @@ class Experiment:
             prompt = build_special_prompt(special_stage["type"], special_stage["target"])
             (self.work_dir / "CURRENT_STAGE.md").write_text(prompt)
         else:
-            stage_spec = self.task_dir / "stages" / f"{stage_id}.md"
+            # Try the spec path from task.yaml first, then fall back to
+            # constructing from stage_id.  This supports tasks whose stage
+            # files don't follow the NN_<id>.md naming convention.
+            stage_spec = None
+            for s in self.task_cfg.get("stages", []):
+                numbered = f"{self.task_cfg['stages'].index(s)+1:02d}_{s['id']}"
+                if numbered == stage_id or s["id"] == stage_id:
+                    if "spec" in s:
+                        candidate = self.task_dir / s["spec"]
+                        if candidate.exists():
+                            stage_spec = candidate
+                    break
+            if stage_spec is None:
+                stage_spec = self.task_dir / "stages" / f"{stage_id}.md"
             if stage_spec.exists():
                 shutil.copy2(stage_spec, self.work_dir / "CURRENT_STAGE.md")
 
@@ -532,6 +617,15 @@ class Experiment:
                 for f in training_dir.iterdir() if training_dir.is_dir() else []:
                     if stage_id.replace("_", "") in f.name.replace("_", "") or stage_id in f.name:
                         shutil.copy2(f, test_dest / f.name)
+
+            # Copy reference data (e.g. .npz files) so training tests don't skip
+            ref_data_dir = self.task_dir / "reference_solutions" / "data"
+            if ref_data_dir.is_dir():
+                dest_ref = self.work_dir / "reference_solutions" / "data"
+                dest_ref.mkdir(parents=True, exist_ok=True)
+                for f in ref_data_dir.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, dest_ref / f.name)
 
         # Generate CLAUDE.md for the workspace
         has_full_spec = protocol.provides_full_spec and (self.work_dir / "spec.md").exists()
@@ -619,6 +713,14 @@ class Experiment:
         git_tag = f"{self.run_id}/{stage_id}"
         self.git.tag(git_tag)
 
+        # Build set of previously-passed holdout test names for regression detection
+        previously_passed = set()
+        for prev_metrics in self.all_metrics:
+            for tr in prev_metrics.test_results:
+                t = tr if isinstance(tr, dict) else {"name": tr.name, "passed": tr.passed, "pool": tr.pool}
+                if t.get("pool") in ("holdout", "regression") and t.get("passed"):
+                    previously_passed.add(t["name"])
+
         # Collect metrics
         metrics = collect_stage_metrics(
             stage_id=stage_id,
@@ -627,6 +729,8 @@ class Experiment:
             test_dir=str(self.test_dir),
             engine_cmd=f"cd {self.work_dir} && {self.engine_cmd}",
             previous_stages=list(self.completed_stages),
+            timeout=600,
+            previously_passed=previously_passed,
         )
         metrics.human_time_seconds = human_time
         metrics.wall_time_seconds = wall_time if wall_time is not None else human_time
@@ -688,12 +792,12 @@ class Experiment:
             print(f"  Phases ({len(metrics.phase_breakdown)}):")
             for pb in metrics.phase_breakdown:
                 err_flag = " [ERROR]" if pb.get("is_error") else ""
-                print(f"    {pb['phase_name']}: {pb['total_tokens']} tokens, "
-                      f"{pb['wall_time_seconds']:.1f}s{err_flag}")
+                print(f"    {pb.get('phase_name', '?')}: {pb.get('total_tokens', 0)} tokens, "
+                      f"{pb.get('wall_time_seconds', 0):.1f}s{err_flag}")
                 if pb.get("sub_results"):
                     for sr in pb["sub_results"]:
-                        print(f"      {sr['phase_name']}: {sr['total_tokens']} tokens, "
-                              f"{sr['wall_time_seconds']:.1f}s")
+                        print(f"      {sr.get('phase_name', '?')}: {sr.get('total_tokens', 0)} tokens, "
+                              f"{sr.get('wall_time_seconds', 0):.1f}s")
         if metrics.spontaneous_behaviors:
             print(f"  Spontaneous behaviors detected ({len(metrics.spontaneous_behaviors)}):")
             for b in metrics.spontaneous_behaviors:
@@ -781,6 +885,39 @@ class Experiment:
             log["slots"] = self.slots
             if pipeline_cfg:
                 log["pipeline_config"] = pipeline_cfg
+
+        # Aggregate denied tool calls across all stages for easy diagnosis
+        all_denied = []
+        for m in self.all_metrics:
+            for d in m.denied_tool_calls:
+                all_denied.append({**d, "stage": m.git_tag.split("/")[-1] if m.git_tag else ""})
+        if all_denied:
+            # Build a frequency table: (tool, command_prefix) -> count + stages
+            from collections import Counter, defaultdict
+            freq = Counter()
+            stages_by_key = defaultdict(set)
+            for d in all_denied:
+                key = (d["tool"], d["input_summary"][:60])
+                freq[key] += 1
+                if d["stage"]:
+                    stages_by_key[key].add(d["stage"])
+            log["denied_tool_calls_summary"] = {
+                "total": len(all_denied),
+                "unique": len(freq),
+                "top": [
+                    {
+                        "tool": tool,
+                        "command": cmd,
+                        "count": count,
+                        "stages": sorted(stages_by_key[(tool, cmd)]),
+                    }
+                    for (tool, cmd), count in freq.most_common(20)
+                ],
+            }
+            print(f"\n  WARNING: {len(all_denied)} denied tool calls across "
+                  f"{len(freq)} unique patterns")
+            for (tool, cmd), count in freq.most_common(5):
+                print(f"    [{tool}] {cmd} (x{count})")
 
         log_path = self.log_dir / f"{self.run_id}.json"
         with open(log_path, "w") as f:

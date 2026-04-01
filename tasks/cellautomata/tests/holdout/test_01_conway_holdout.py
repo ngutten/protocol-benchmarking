@@ -195,9 +195,11 @@ class TestUIInteraction:
         assert "0" in lbl.text()
 
         qtbot.mouseClick(btn_start, Qt.LeftButton)
-        # Wait for at least one step to fire
-        qtbot.waitUntil(lambda: "0" not in lbl.text() or lbl.text().strip() != "0",
-                        timeout=2000)
+        # Wait for step count to advance past 0
+        def _step_advanced():
+            digits = "".join(c for c in lbl.text() if c.isdigit())
+            return digits != "" and int(digits) > 0
+        qtbot.waitUntil(_step_advanced, timeout=2000)
         qtbot.mouseClick(btn_stop, Qt.LeftButton)
 
         # Step count should have advanced past 0

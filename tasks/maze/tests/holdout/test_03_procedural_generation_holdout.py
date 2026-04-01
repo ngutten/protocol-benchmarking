@@ -67,12 +67,14 @@ class TestMazeGenerationQuality:
         for _ in range(3):
             page.evaluate("() => window.game.regenerateMaze(10, 10)")
             page.wait_for_timeout(300)
-            # Snapshot first row of cells
+            # Snapshot entire maze contents
             w = page.evaluate("() => window.game.getMazeWidth()")
-            row = []
-            for x in range(w):
-                row.append(get_maze_cell(page, x, 0))
-            mazes.append(tuple(row))
+            h = page.evaluate("() => window.game.getMazeHeight()")
+            grid = []
+            for y in range(h):
+                for x in range(w):
+                    grid.append(get_maze_cell(page, x, y))
+            mazes.append(tuple(grid))
 
         unique = len(set(mazes))
         assert unique >= 2, f"Expected different mazes but got {unique} unique out of 3"

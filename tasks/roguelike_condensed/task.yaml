@@ -1,0 +1,59 @@
+name: roguelike_condensed
+title: "Roguelike (Condensed): ASCII Dungeon Crawler in C++ with ncurses"
+description: >
+  Multi-stage C++ roguelike game with ncurses frontend and headless engine.
+  Features entity-component architecture, modifier stacks, turn-based combat,
+  FOV/lighting, procedural generation, and save/load. Tests exercise the
+  headless engine via a JSON-line test harness binary.
+  This is a condensed 4-stage variant of the 12-stage roguelike task.
+
+engine_cmd: "./build/test_harness"
+
+domain_tags:
+  - game
+  - stateful
+  - simulation
+  - gui
+  - cpp
+
+stages:
+  - id: core_stats_turns
+    spec: stages/01_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_01_core_stats_turns.py
+    holdout_tests: tests/holdout/test_01_core_stats_turns_holdout.py
+
+  - id: fov_combat_items
+    spec: stages/02_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_02_fov_combat_items.py
+    holdout_tests: tests/holdout/test_02_fov_combat_items_holdout.py
+
+  - id: abilities_ranged_procgen
+    spec: stages/03_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_03_abilities_ranged_procgen.py
+    holdout_tests: tests/holdout/test_03_abilities_ranged_procgen_holdout.py
+
+  - id: identification_save_multitile
+    spec: stages/04_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_04_identification_save_multitile.py
+    holdout_tests: tests/holdout/test_04_identification_save_multitile_holdout.py
+
+pipelines:
+  sequential_full:
+    stages:
+      - core_stats_turns
+      - fov_combat_items
+      - abilities_ranged_procgen
+      - identification_save_multitile
+    differential: sequential
+
+  sequential_diff_ab:
+    stages:
+      - {stage: core_stats_turns, slot: A}
+      - {stage: fov_combat_items, slot: B}
+      - {stage: abilities_ranged_procgen, slot: B}
+      - {stage: identification_save_multitile, slot: B}
+    differential: sequential

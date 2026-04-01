@@ -7,7 +7,7 @@ import tempfile
 import pytest
 
 
-ENGINE_CMD = os.environ.get("PLOTCURVE_ENGINE_CMD", os.environ.get("MINIDB_ENGINE_CMD", "python3 plotcurve.py"))
+ENGINE_CMD = os.environ.get("ENGINE_CMD", "python3 plotcurve.py")
 
 
 class PlotCurveEngine:

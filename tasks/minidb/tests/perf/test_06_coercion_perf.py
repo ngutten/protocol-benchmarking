@@ -26,7 +26,7 @@ class TestCoercionPerf:
         self._populate_mixed(engine, 200)
         start = time.perf_counter()
         for _ in range(20):
-            engine.query_rows("SELECT id FROM perf WHERE val > 50")
+            engine.try_query_rows("SELECT id FROM perf WHERE val > 50")
         elapsed = time.perf_counter() - start
         print(f'{{"bench_metric": "ops_per_second", "test": "test_cross_type_comparison_200_rows", "value": {20 / elapsed:.2f}, "iterations": 20, "duration_seconds": {elapsed:.6f}}}')
 
@@ -35,7 +35,7 @@ class TestCoercionPerf:
         self._populate_mixed(engine, 200)
         start = time.perf_counter()
         for _ in range(20):
-            engine.query_rows("SELECT val + 1 FROM perf")
+            engine.try_query_rows("SELECT val + 1 FROM perf")
         elapsed = time.perf_counter() - start
         print(f'{{"bench_metric": "ops_per_second", "test": "test_mixed_type_arithmetic", "value": {20 / elapsed:.2f}, "iterations": 20, "duration_seconds": {elapsed:.6f}}}')
 
@@ -44,6 +44,6 @@ class TestCoercionPerf:
         self._populate_mixed(engine, 200)
         start = time.perf_counter()
         for _ in range(20):
-            engine.query_rows("SELECT TYPEOF(val) FROM perf")
+            engine.try_query_rows("SELECT TYPEOF(val) FROM perf")
         elapsed = time.perf_counter() - start
         print(f'{{"bench_metric": "ops_per_second", "test": "test_typeof_scan", "value": {20 / elapsed:.2f}, "iterations": 20, "duration_seconds": {elapsed:.6f}}}')

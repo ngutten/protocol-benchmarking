@@ -20,8 +20,8 @@ import pytest
 #   "cd <workspace> && python3 -m http.server 8000"
 # We parse the workspace path so we can serve those files.
 # ---------------------------------------------------------------------------
-ENGINE_CMD_ENV = "MAZE_ENGINE_CMD"
-_engine_cmd = os.environ.get(ENGINE_CMD_ENV, os.environ.get("MINIDB_ENGINE_CMD", ""))
+ENGINE_CMD_ENV = "ENGINE_CMD"
+_engine_cmd = os.environ.get(ENGINE_CMD_ENV, "")
 
 if _engine_cmd and "cd " in _engine_cmd:
     _workspace = _engine_cmd.split("&&")[0].replace("cd ", "").strip()

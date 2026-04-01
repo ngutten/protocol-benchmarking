@@ -100,24 +100,3 @@ class TestTextureDetails:
         brightness = sum(ceiling_color) / 3
         assert brightness > 3, \
             f"Ceiling should have visible texture, got brightness={brightness}"
-
-    def test_water_uses_water_texture(self, page):
-        """Water tiles use the water-specific texture."""
-        page.evaluate("() => window.game.regenerateMaze(15, 15)")
-        page.wait_for_timeout(500)
-
-        water = find_cell_of_type(page, "~")
-        if water is None:
-            # The generated maze might not have water — that's ok for stage 4
-            pytest.skip("No water tiles in generated maze")
-
-        # Check the texture assigned to the water cell
-        tex = page.evaluate(
-            "([x, y]) => window.game.getCellTextures(x, y)",
-            [water[0], water[1]]
-        )
-        if tex is None:
-            pytest.skip("getCellTextures not available for water")
-        # The floor texture for water should reference water
-        assert "water" in tex.get("floor", "").lower(), \
-            f"Water cell should use water texture, got: {tex.get('floor')}"

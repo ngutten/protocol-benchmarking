@@ -1,0 +1,122 @@
+name: roguelike
+title: "Roguelike: ASCII Dungeon Crawler in C++ with ncurses"
+description: >
+  Multi-stage C++ roguelike game with ncurses frontend and headless engine.
+  Features entity-component architecture, modifier stacks, turn-based combat,
+  FOV/lighting, procedural generation, and save/load. Tests exercise the
+  headless engine via a JSON-line test harness binary.
+
+engine_cmd: "./build/test_harness"
+
+domain_tags:
+  - game
+  - stateful
+  - simulation
+  - gui
+  - cpp
+
+stages:
+  - id: core_skeleton
+    spec: stages/01_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_01_core_skeleton.py
+    holdout_tests: tests/holdout/test_01_core_skeleton_holdout.py
+
+  - id: stats_modifiers
+    spec: stages/02_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_02_stats_modifiers.py
+    holdout_tests: tests/holdout/test_02_stats_modifiers_holdout.py
+
+  - id: turn_enemies_ai
+    spec: stages/03_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_03_turn_enemies_ai.py
+    holdout_tests: tests/holdout/test_03_turn_enemies_ai_holdout.py
+
+  - id: fov_lighting
+    spec: stages/04_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_04_fov_lighting.py
+    holdout_tests: tests/holdout/test_04_fov_lighting_holdout.py
+
+  - id: combat_status
+    spec: stages/05_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_05_combat_status.py
+    holdout_tests: tests/holdout/test_05_combat_status_holdout.py
+
+  - id: items_inventory
+    spec: stages/06_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_06_items_inventory.py
+    holdout_tests: tests/holdout/test_06_items_inventory_holdout.py
+
+  - id: abilities
+    spec: stages/07_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_07_abilities.py
+    holdout_tests: tests/holdout/test_07_abilities_holdout.py
+
+  - id: ranged_targeting
+    spec: stages/08_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_08_ranged_targeting.py
+    holdout_tests: tests/holdout/test_08_ranged_targeting_holdout.py
+
+  - id: procgen
+    spec: stages/09_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_09_procgen.py
+    holdout_tests: tests/holdout/test_09_procgen_holdout.py
+
+  - id: identification_integration
+    spec: stages/10_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_10_identification_integration.py
+    holdout_tests: tests/holdout/test_10_identification_integration_holdout.py
+
+  - id: save_load
+    spec: stages/11_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_11_save_load.py
+    holdout_tests: tests/holdout/test_11_save_load_holdout.py
+
+  - id: multi_tile
+    spec: stages/12_STAGE.md
+    type: feature_addition
+    training_tests: tests/training/test_12_multi_tile.py
+    holdout_tests: tests/holdout/test_12_multi_tile_holdout.py
+
+pipelines:
+  sequential_full:
+    stages:
+      - core_skeleton
+      - stats_modifiers
+      - turn_enemies_ai
+      - fov_lighting
+      - combat_status
+      - items_inventory
+      - abilities
+      - ranged_targeting
+      - procgen
+      - identification_integration
+      - save_load
+      - multi_tile
+    differential: sequential
+
+  sequential_diff_ab:
+    stages:
+      - {stage: core_skeleton, slot: A}
+      - {stage: stats_modifiers, slot: A}
+      - {stage: turn_enemies_ai, slot: A}
+      - {stage: fov_lighting, slot: B}
+      - {stage: combat_status, slot: B}
+      - {stage: items_inventory, slot: B}
+      - {stage: abilities, slot: B}
+      - {stage: ranged_targeting, slot: B}
+      - {stage: procgen, slot: B}
+      - {stage: identification_integration, slot: B}
+      - {stage: save_load, slot: B}
+      - {stage: multi_tile, slot: B}
+    differential: sequential

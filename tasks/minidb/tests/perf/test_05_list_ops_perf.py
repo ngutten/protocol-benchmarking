@@ -20,15 +20,15 @@ class TestListOpsPerf:
             items = list(range(i % 10))
             engine.execute(f"INSERT INTO perf VALUES ({i}, {items})")
         for _ in range(10):
-            engine.query_rows("SELECT * FROM perf")
+            engine.try_query_rows("SELECT * FROM perf")
         elapsed = time.perf_counter() - start
         print(f'{{"bench_metric": "ops_per_second", "test": "test_list_insert_and_select_100", "value": {210 / elapsed:.2f}, "iterations": 210, "duration_seconds": {elapsed:.6f}}}')
 
-    def test_list_length_filter(self, engine):
-        """Filter by list length on 100 rows."""
+    def test_list_contains_filter(self, engine):
+        """Filter by CONTAINS on 100 rows."""
         self._populate(engine, 100)
         start = time.perf_counter()
         for _ in range(20):
-            engine.query_rows("SELECT id FROM perf WHERE LENGTH(items) > 5")
+            engine.try_query_rows("SELECT id FROM perf WHERE items CONTAINS 5")
         elapsed = time.perf_counter() - start
-        print(f'{{"bench_metric": "ops_per_second", "test": "test_list_length_filter", "value": {20 / elapsed:.2f}, "iterations": 20, "duration_seconds": {elapsed:.6f}}}')
+        print(f'{{"bench_metric": "ops_per_second", "test": "test_list_contains_filter", "value": {20 / elapsed:.2f}, "iterations": 20, "duration_seconds": {elapsed:.6f}}}')

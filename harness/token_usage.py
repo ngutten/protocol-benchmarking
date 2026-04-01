@@ -43,11 +43,42 @@ def parse_claude_json_output(output: str) -> dict:
     return info
 
 
+def _sum_jsonl_usage(filepath: Path) -> dict:
+    """Sum token usage fields across all messages in a single JSONL file."""
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+    }
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg_usage = (
+                msg.get("message", {}).get("usage", {})
+                if isinstance(msg.get("message"), dict)
+                else msg.get("usage", {})
+            )
+            if msg_usage:
+                usage["input_tokens"] += msg_usage.get("input_tokens", 0)
+                usage["output_tokens"] += msg_usage.get("output_tokens", 0)
+                usage["cache_read_tokens"] += msg_usage.get("cache_read_input_tokens", 0)
+                usage["cache_creation_tokens"] += msg_usage.get("cache_creation_input_tokens", 0)
+    return usage
+
+
 def get_session_token_usage(session_id: str, project_dir: str = None) -> dict:
-    """Parse a Claude session JSONL file for token usage.
+    """Parse a Claude session JSONL file for token usage, including sub-agents.
 
     Searches for session files in ~/.claude/projects/<encoded-path>/<session_id>.jsonl
-    and sums up all usage fields across messages.
+    and sums up all usage fields across messages.  Also includes token usage from
+    any sub-agent sessions stored in <session_id>/subagents/*.jsonl.
 
     Returns dict with keys: input_tokens, output_tokens, total_tokens,
     cache_read_tokens, cache_creation_tokens.
@@ -80,22 +111,51 @@ def get_session_token_usage(session_id: str, project_dir: str = None) -> dict:
     if not session_file or not session_file.exists():
         return usage
 
-    with open(session_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    # Sum parent session usage
+    parent_usage = _sum_jsonl_usage(session_file)
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
+        usage[key] += parent_usage[key]
 
-            msg_usage = msg.get("message", {}).get("usage", {}) if isinstance(msg.get("message"), dict) else msg.get("usage", {})
-            if msg_usage:
-                usage["input_tokens"] += msg_usage.get("input_tokens", 0)
-                usage["output_tokens"] += msg_usage.get("output_tokens", 0)
-                usage["cache_read_tokens"] += msg_usage.get("cache_read_input_tokens", 0)
-                usage["cache_creation_tokens"] += msg_usage.get("cache_creation_input_tokens", 0)
+    # Sum sub-agent session usage (stored in <session_id>/subagents/*.jsonl)
+    subagents_dir = session_file.parent / session_id / "subagents"
+    if subagents_dir.is_dir():
+        for sub_jsonl in subagents_dir.glob("*.jsonl"):
+            sub_usage = _sum_jsonl_usage(sub_jsonl)
+            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
+                usage[key] += sub_usage[key]
+
+    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    return usage
+
+
+def get_subagent_token_usage(session_id: str) -> dict:
+    """Get token usage from sub-agents only (not the parent session).
+
+    Used to supplement the parent session's JSON-reported usage, which
+    does not include tokens consumed by sub-agents spawned via the Agent tool.
+
+    Returns dict with keys: input_tokens, output_tokens, total_tokens,
+    cache_read_tokens, cache_creation_tokens (zeros if no sub-agents found).
+    """
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+    }
+    session_file = _find_session_file(session_id)
+    if not session_file:
+        return usage
+
+    subagents_dir = session_file.parent / session_id / "subagents"
+    if not subagents_dir.is_dir():
+        return usage
+
+    for sub_jsonl in subagents_dir.glob("*.jsonl"):
+        sub_usage = _sum_jsonl_usage(sub_jsonl)
+        for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
+            usage[key] += sub_usage[key]
 
     usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
     return usage
