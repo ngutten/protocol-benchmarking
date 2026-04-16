@@ -20,6 +20,8 @@ def _build_base_cmd(protocol, permission_mode="acceptEdits"):
     cmd = ["claude"]
     cmd.extend(["--model", protocol.model])
     cmd.extend(["--permission-mode", permission_mode])
+    if protocol.system_prompt:
+        cmd.extend(["--system-prompt", protocol.system_prompt])
 
     for tool in protocol.get_allowed_tools():
         cmd.extend(["--allowedTools", tool])
@@ -167,6 +169,8 @@ def _run_phase(phase, prompt_text, work_dir, protocol, timeout):
     cmd = ["claude"]
     cmd.extend(["--model", model])
     cmd.extend(["--permission-mode", perm])
+    if protocol.system_prompt:
+        cmd.extend(["--system-prompt", protocol.system_prompt])
     for tool in protocol.get_allowed_tools():
         cmd.extend(["--allowedTools", tool])
     cmd.extend(["--output-format", "json"])

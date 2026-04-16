@@ -1,18 +1,36 @@
 """Built-in benchmark protocols."""
 from . import ProtocolDef, PhaseDef
 
+_DIRECT_NO_TESTS_INSTRUCTIONS = (
+    "Implement the following specification directly. "
+    "You may run the engine to test it manually, but no automated tests are provided.\n\n"
+    "IMPORTANT constraints for this task:\n"
+    "- Do NOT write a plan or design document before coding. Start implementing immediately.\n"
+    "- Do NOT create test files or a test suite. No unit tests, no integration tests, no test scripts.\n"
+    "- Do NOT create TODO lists, architecture docs, or README files.\n"
+    "- Focus purely on writing the implementation code that satisfies the specification."
+)
+
 DIRECT_NO_TESTS = ProtocolDef(
     name="direct_no_tests",
     description="LLM gets the stage spec only. No tests provided. Implement until done.",
     provides_spec=True,
     provides_training_tests=False,
-    added_instructions="Implement the following specification directly. "
-        "You may run the engine to test it manually, but no automated tests are provided.\n\n"
-        "IMPORTANT constraints for this task:\n"
-        "- Do NOT write a plan or design document before coding. Start implementing immediately.\n"
-        "- Do NOT create test files or a test suite. No unit tests, no integration tests, no test scripts.\n"
-        "- Do NOT create TODO lists, architecture docs, or README files.\n"
-        "- Focus purely on writing the implementation code that satisfies the specification.",
+    added_instructions=_DIRECT_NO_TESTS_INSTRUCTIONS,
+)
+
+_DIRECT_NULL_PROMPT_INSTRUCTIONS = (
+    _DIRECT_NO_TESTS_INSTRUCTIONS
+    + "\n- Writing any test file invalidates this run."
+)
+
+DIRECT_NULL_PROMPT = ProtocolDef(
+    name="direct_null_prompt",
+    description="Same as direct_no_tests, but the instructions replace the default Claude Code system prompt via --system-prompt.",
+    provides_spec=True,
+    provides_training_tests=False,
+    system_prompt=_DIRECT_NULL_PROMPT_INSTRUCTIONS,
+    added_instructions=_DIRECT_NULL_PROMPT_INSTRUCTIONS,
 )
 
 DIRECT_SPEED = ProtocolDef(
@@ -192,8 +210,57 @@ COMPRESSED_ADVERSARIAL = ProtocolDef(
     ],
 )
 
+QUALITATIVE_ADVERSARIAL = ProtocolDef(
+    name="qualitative_adversarial",
+    description="Focus adversarial critique on structural aspects, not unit tests",
+    provides_spec=True,
+    provides_training_tests=False,
+    phases=[
+        PhaseDef(
+            name="implement",
+            prompt_template="Read CURRENT_STAGE.md and implement it. Focus on implementation. While you may run the program to verify its behavior, no tests are provided and you should not write your own unit tests. "
+                "You should not unit-test individual features in isolation. Take care to make the code correct and efficient - use vectorization instead of for loops, re-use methods, avoid duplication.\n"
+                "- Do NOT run pytest or equivalent testing code, or write individual test files. This will be recorded and will invalidate the run. ",
+            permission_mode="acceptEdits",
+        ),
+        PhaseDef(
+            name="review",
+            prompt_template="You have been provided code that attempts to implement CURRENT_STAGE.md.  "
+                 "Make sure the approach to CURRENT_STAGE.md is complete and satisfies the intent of the spec rather than just ticking boxes - it will be exposed to tests which have not been provided, so you are looking at ways it could fail. "
+                 "Trace the code flow and logic, but do NOT write code here or run the program. You should take a critical but neutral stance - don't assume competency from the other coder, do not sugarcoat issues or try to balance criticisms with compliments. "
+                 "In particular, flag code paths that silently discard or ignore inputs, inefficient approaches - for loops that should be vectorized for example, branches that silently fall through, functions that return None or default for unhandled cases, parameters that exist in one code path but not a parallel one, and code which is present but not wired up (and other stubs). "
+                 "Do not be overly concerned with abstract code quality. Write your critique to REVIEW.md.",
+            permission_mode="acceptEdits",
+        ),
+         PhaseDef(
+            name="fix",
+            prompt_template="Read REVIEW.md and fix each issue. Delete REVIEW.md when done.",
+            permission_mode="acceptEdits",
+        ),
+   ],
+)
+
+OBSERVATION_FOCUS = ProtocolDef(
+    name="observation_focus",
+    description="Focus on making code paths observable and checking code logic over tests",
+    provides_spec=True,
+    provides_training_tests=False,
+    phases=[
+        PhaseDef(
+            name="implement",
+            prompt_template="Read CURRENT_STAGE.md and implement it. As you implement it, you should include debug messages tied to a debug mode flag to let you monitor the code function and check on the state. "
+                "If this is not the first stage, make sure to re-enable the debug flag, as it is set to false at the end of each stage. "
+                "Do not write individual tests, but instead come up with a few fully integrated scenarios and do complete runs while watching the debug output. "
+                "Check the debug output against your expectations, and if encountering a bug or surprise don't just guess and check unless its very simple - add diagnostics to help you track down and understand the issue. "
+                "When the code is ready to submit, disable the debug flag but leave all the debug hooks in the codebase for future stages. ",
+            permission_mode="acceptEdits",
+        ),
+   ],
+)
+
 PROTOCOLS = [
     DIRECT_NO_TESTS,
+    DIRECT_NULL_PROMPT,
     DIRECT_SPEED,
     DIRECT_MODULAR,
     DIRECT_LOOKAHEAD,
@@ -203,5 +270,7 @@ PROTOCOLS = [
     HUMAN_SUPERVISED,
     SEQUENTIAL_PIPELINE,
     PLAN_PARALLEL_IMPLEMENT,
-    COMPRESSED_ADVERSARIAL
+    COMPRESSED_ADVERSARIAL,
+    QUALITATIVE_ADVERSARIAL,
+    OBSERVATION_FOCUS
 ]

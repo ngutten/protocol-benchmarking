@@ -115,10 +115,17 @@ class StageMetrics:
         return d
 
 
-def run_pytest(test_path, engine_cmd, conftest_dir=None, timeout=120):
-    """Run pytest on a test file/dir and return structured results."""
+def run_pytest(test_path, engine_cmd, conftest_dir=None, timeout=120, server_cmd=None):
+    """Run pytest on a test file/dir and return structured results.
+
+    server_cmd, when provided, is exported as SERVER_CMD for tasks whose
+    test fixtures spawn a server binary distinct from `engine_cmd`
+    (e.g. MUD's stage 1 mud.py vs. stage 2/3 mudserver.py).
+    """
     env = os.environ.copy()
     env["ENGINE_CMD"] = engine_cmd
+    if server_cmd:
+        env["SERVER_CMD"] = server_cmd
     cmd = ["python3", "-m", "pytest", test_path, "-v", "--tb=short"]
     if conftest_dir:
         cmd.extend(["--rootdir", conftest_dir, "-c", "/dev/null"])
@@ -146,7 +153,7 @@ def run_pytest(test_path, engine_cmd, conftest_dir=None, timeout=120):
     return tests, result.returncode
 
 
-def run_perf_tests(test_path, engine_cmd, conftest_dir=None, timeout=300):
+def run_perf_tests(test_path, engine_cmd, conftest_dir=None, timeout=300, server_cmd=None):
     """Run performance benchmark tests and return timing results.
 
     Perf tests are standard pytest files in tests/perf/. Each test function
@@ -176,6 +183,8 @@ def run_perf_tests(test_path, engine_cmd, conftest_dir=None, timeout=300):
     """
     env = os.environ.copy()
     env["ENGINE_CMD"] = engine_cmd
+    if server_cmd:
+        env["SERVER_CMD"] = server_cmd
     cmd = [
         "python3", "-m", "pytest", test_path,
         "-v", "-s", "--tb=short", "--durations=0",
@@ -288,7 +297,7 @@ def count_code(project_dir, extensions=(".py", ".cpp", ".cc", ".h", ".hpp", ".rs
     return total_lines, total_bytes
 
 
-def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd, previous_stages, timeout=120, previously_passed=None):
+def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd, previous_stages, timeout=120, previously_passed=None, server_cmd=None):
     """Collect all metrics after a completed stage.
 
     Args:
@@ -307,7 +316,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
     tp = os.path.join(test_dir, "training")
     for f in os.listdir(tp) if os.path.isdir(tp) else []:
         if (stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f))) and f.endswith(".py"):
-            results, _ = run_pytest(os.path.join(tp, f), engine_cmd, conftest_dir, timeout=timeout)
+            results, _ = run_pytest(os.path.join(tp, f), engine_cmd, conftest_dir, timeout=timeout, server_cmd=server_cmd)
             metrics.training_tests_total += len(results)
             metrics.training_tests_passed += sum(1 for r in results if r.passed)
             for r in results:
@@ -318,7 +327,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
     hp = os.path.join(test_dir, "holdout")
     for f in os.listdir(hp) if os.path.isdir(hp) else []:
         if (stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f))) and f.endswith(".py"):
-            results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir, timeout=timeout)
+            results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir, timeout=timeout, server_cmd=server_cmd)
             metrics.holdout_tests_total += len(results)
             metrics.holdout_tests_passed += sum(1 for r in results if r.passed)
             for r in results:
@@ -332,7 +341,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
         prev_prefix = prev.split("_")[0] if "_" in prev else ""
         for f in os.listdir(hp) if os.path.isdir(hp) else []:
             if (prev in f or (prev_prefix and re.match(rf"test_{prev_prefix}_", f))) and f.endswith(".py"):
-                results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir, timeout=timeout)
+                results, _ = run_pytest(os.path.join(hp, f), engine_cmd, conftest_dir, timeout=timeout, server_cmd=server_cmd)
                 for r in results:
                     r.stage, r.pool = prev, "regression"
                     reg_total += 1
@@ -351,7 +360,7 @@ def collect_stage_metrics(stage_id, protocol, project_dir, test_dir, engine_cmd,
                 continue
             # Match by stage_id or numeric prefix, same as holdout
             if stage_id in f or (stage_prefix and re.match(rf"test_{stage_prefix}_", f)):
-                perf_results = run_perf_tests(os.path.join(pp, f), engine_cmd, conftest_dir, timeout=max(timeout, 300))
+                perf_results = run_perf_tests(os.path.join(pp, f), engine_cmd, conftest_dir, timeout=max(timeout, 300), server_cmd=server_cmd)
                 metrics.perf_tests_total += len(perf_results)
                 metrics.perf_tests_passed += sum(1 for r in perf_results if r.passed)
                 for r in perf_results:

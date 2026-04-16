@@ -1,0 +1,121 @@
+{
+  "start": "foyer",
+  "rooms": {
+    "foyer": {
+      "name": "Foyer",
+      "description": "A dusty foyer. Marble floors are cracked under your feet, and a cold draft curls down from somewhere above.",
+      "exits": {"east": "library", "north": "garden"},
+      "objects": ["brass_lantern", "rusted_key"]
+    },
+    "library": {
+      "name": "Library",
+      "description": "Tall shelves loom in the gloom, packed with books whose spines have long since faded to grey. A narrow iron grate is set into the floor at the far end.",
+      "exits": {
+        "west": "foyer",
+        "down": {
+          "room": "cellar",
+          "locked_by": "rusted_key",
+          "locked_message": "The iron grate covering the stairs down is padlocked shut."
+        }
+      },
+      "objects": ["stone_plaque", "old_book"]
+    },
+    "garden": {
+      "name": "Overgrown Garden",
+      "description": "Ivy has swallowed what must once have been carefully tended beds. A single rose still blooms, improbably red.",
+      "exits": {"south": "foyer"},
+      "objects": ["health_potion", "garden_key"]
+    },
+    "cellar": {
+      "name": "Cellar",
+      "description": "Damp stone walls crowd close. Rusted hooks hang from the ceiling, and a long shape rests on a stone bench against the far wall.",
+      "dark": true,
+      "dark_description": "You are in pitch darkness. The air is cold and smells of old iron. You can hear the faint drip of water somewhere nearby.",
+      "exits": {"up": "library"},
+      "objects": ["tarnished_sword"]
+    }
+  },
+  "objects": {
+    "brass_lantern": {
+      "name": "brass lantern",
+      "aliases": ["lantern", "lamp"],
+      "description": "A tarnished brass lantern, cold to the touch but heavier than it looks.",
+      "portable": true,
+      "toggle": {
+        "initial": "off",
+        "on_message": "You light the lantern, and its flame throws long shadows against the walls.",
+        "off_message": "You snuff the lantern's flame. The shadows fold back in."
+      },
+      "light": true
+    },
+    "rusted_key": {
+      "name": "rusted key",
+      "aliases": ["key"],
+      "description": "An iron key, rust-pitted but still solid. It bears the faint shape of a library seal.",
+      "portable": true
+    },
+    "stone_plaque": {
+      "name": "stone plaque",
+      "aliases": ["plaque"],
+      "description": "A weathered stone plaque set into the wall. The original inscription has eroded beyond reading.",
+      "portable": false
+    },
+    "old_book": {
+      "name": "old book",
+      "aliases": ["book", "tome"],
+      "description": "A leather-bound book, its pages brittle and its title long since flaked away.",
+      "portable": true,
+      "use_effect": {"message": "You thumb through the pages. A loose sheet mentions a lost king named Arell and a stair that descends from the library.", "consumed": false}
+    },
+    "health_potion": {
+      "name": "health potion",
+      "aliases": ["potion", "vial"],
+      "description": "A small glass vial of dark red liquid. It is faintly warm.",
+      "portable": true,
+      "use_effect": {"message": "You drink the potion. Warmth spreads through your limbs and the ache in your shoulder fades.", "consumed": true}
+    },
+    "garden_key": {
+      "name": "garden key",
+      "aliases": ["key"],
+      "description": "A delicate brass key with a leaf-shaped bow. It looks far too slender for any of the iron locks in this house.",
+      "portable": true,
+      "use_effect": {"message": "You try the garden key, but it fits no lock here.", "consumed": false}
+    },
+    "tarnished_sword": {
+      "name": "tarnished sword",
+      "aliases": ["sword", "blade"],
+      "description": "A longsword with a tarnished grip. The edge is still surprisingly keen.",
+      "portable": true
+    }
+  },
+  "npcs": {
+    "ghost": {
+      "name": "pale ghost",
+      "aliases": ["ghost"],
+      "description": "A translucent figure that drifts without sound. Its eyes are fixed on something you cannot see.",
+      "start_room": "library",
+      "script": [
+        {"action": "say", "text": "Arell... where is Arell..."},
+        {"action": "emote", "text": "drifts slowly toward the shelves"},
+        {"action": "wait"},
+        {"action": "move", "direction": "west"},
+        {"action": "say", "text": "The foyer is colder than I remember."},
+        {"action": "wait"},
+        {"action": "move", "direction": "east"}
+      ]
+    },
+    "adventurer": {
+      "name": "confused adventurer",
+      "aliases": ["adventurer", "explorer"],
+      "description": "A young man in muddy travelling clothes, holding an unrolled map upside down. He keeps glancing at the floor.",
+      "start_room": "library",
+      "script": [
+        {"action": "say", "text": "I'm sure the stairs were around here somewhere..."},
+        {"action": "emote", "text": "shuffles in a slow circle, peering at the floor"},
+        {"action": "wait"},
+        {"action": "move", "direction": "down"},
+        {"action": "wait"}
+      ]
+    }
+  }
+}

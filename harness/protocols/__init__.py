@@ -164,6 +164,9 @@ class ProtocolDef:
     token_budget: int = 1_000_000
     # Additional instructions prepended to the spec
     added_instructions: str = ""
+    # If set, passed via `claude --system-prompt`, replacing the default
+    # Claude Code system prompt for the session.
+    system_prompt: Optional[str] = None
     # Model to use (default: Sonnet 4.6)
     model: str = "claude-sonnet-4-6"
     # Additional allowed tools beyond defaults (use Bash(...) patterns)

@@ -1,0 +1,49 @@
+name: mud
+title: "MUD: Text Adventure → Multi-User Server with NPCs and Persistence"
+description: >
+  A three-stage build-up: from a single-player text adventure with
+  light/dark, toggle objects, and locked exits → to a TCP server with
+  multi-user broadcasts, presence, and slow-client-tolerant concurrency
+  → to chat, persistent player-authored graffiti, self-descriptions, and
+  scripted NPCs driven by a wallclock heartbeat. Each stage is
+  refactor-heavy: Stage 1's stdin/stdout REPL becomes Stage 2's TCP
+  server + thin client; Stage 2's broadcast pipeline gains persistence
+  and a tick scheduler in Stage 3.
+
+engine_cmd: "python3 mud.py"
+server_cmd: "python3 mudserver.py"
+
+domain_tags:
+  - stateful
+  - parser
+  - networked
+  - concurrency
+  - persistence
+  - refactor
+
+stages:
+  - id: single_player
+    spec: stages/01_single_player.md
+    type: feature_addition
+    training_tests: tests/training/test_01_single_player.py
+    holdout_tests: tests/holdout/test_01_single_player_holdout.py
+    perf_tests: tests/perf/test_01_single_player_perf.py
+
+  - id: client_server
+    spec: stages/02_client_server.md
+    type: feature_addition
+    training_tests: tests/training/test_02_client_server.py
+    holdout_tests: tests/holdout/test_02_client_server_holdout.py
+    perf_tests: tests/perf/test_02_client_server_perf.py
+
+  - id: chat_and_graffiti
+    spec: stages/03_chat_and_graffiti.md
+    type: feature_addition
+    training_tests: tests/training/test_03_chat_and_graffiti.py
+    holdout_tests: tests/holdout/test_03_chat_and_graffiti_holdout.py
+    perf_tests: tests/perf/test_03_chat_and_graffiti_perf.py
+
+pipelines:
+  sequential_full:
+    stages: [single_player, client_server, chat_and_graffiti]
+    differential: sequential

@@ -253,6 +253,11 @@ class Experiment:
         else:
             self.engine_cmd = engine_cmd
 
+        # Optional second binary command for tasks whose tests spawn a
+        # server distinct from `engine_cmd` (e.g. MUD's mudserver.py).
+        # Exposed to test fixtures as the SERVER_CMD env var.
+        self.server_cmd = self.task_cfg.get("server_cmd")
+
         # Inject engine_cmd-derived tool permissions so the headless Claude
         # instance (and interactive settings.local.json) can run the task
         # binary without hitting approval prompts.  We copy the protocol to
@@ -589,6 +594,36 @@ class Experiment:
             if stage_spec.exists():
                 shutil.copy2(stage_spec, self.work_dir / "CURRENT_STAGE.md")
 
+        # Apply stage-specific asset overlay, if present.
+        #
+        # Layout convention: tasks/<task>/stages/<NN_stage_id>_assets/ is a
+        # directory whose contents are copied over workspace/assets/ when that
+        # stage begins. Files in the overlay overwrite files from the base
+        # tasks/<task>/assets/ that were copied at workspace init. Alternately,
+        # a stage entry in task.yaml may specify `stage_assets: <path>` to
+        # override the convention.
+        #
+        # Overlays accumulate across sequential stages: a stage without an
+        # overlay inherits whatever the prior stage left in place. Non-linear
+        # stage orderings may therefore see stale overlay content.
+        if not special_stage:
+            stage_assets_src = None
+            for s in self.task_cfg.get("stages", []):
+                numbered = f"{self.task_cfg['stages'].index(s)+1:02d}_{s['id']}"
+                if numbered == stage_id or s["id"] == stage_id:
+                    if "stage_assets" in s:
+                        candidate = self.task_dir / s["stage_assets"]
+                        if candidate.is_dir():
+                            stage_assets_src = candidate
+                    if stage_assets_src is None:
+                        candidate = self.task_dir / "stages" / f"{numbered}_assets"
+                        if candidate.is_dir():
+                            stage_assets_src = candidate
+                    break
+            if stage_assets_src is not None:
+                shutil.copytree(stage_assets_src, self.work_dir / "assets",
+                                dirs_exist_ok=True)
+
         # Always copy conftest.py so the LLM knows the test harness interface
         test_dest = self.work_dir / "tests"
         test_dest.mkdir(exist_ok=True)
@@ -722,12 +757,16 @@ class Experiment:
                     previously_passed.add(t["name"])
 
         # Collect metrics
+        server_cmd_env = (
+            f"cd {self.work_dir} && {self.server_cmd}" if self.server_cmd else None
+        )
         metrics = collect_stage_metrics(
             stage_id=stage_id,
             protocol=protocol.name,
             project_dir=str(self.work_dir),
             test_dir=str(self.test_dir),
             engine_cmd=f"cd {self.work_dir} && {self.engine_cmd}",
+            server_cmd=server_cmd_env,
             previous_stages=list(self.completed_stages),
             timeout=600,
             previously_passed=previously_passed,
